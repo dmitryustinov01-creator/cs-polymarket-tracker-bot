@@ -12,7 +12,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # ─── Config ──────────────────────────────────────────────────────────────────
 
-BOT_TOKEN = os.getenv(“BOT_TOKEN”, “”)
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHECK_INTERVAL = int(os.getenv(“CHECK_INTERVAL”, “120”))  # seconds
 HLTV_UPDATE_INTERVAL = 3600  # refresh ranking every hour
 

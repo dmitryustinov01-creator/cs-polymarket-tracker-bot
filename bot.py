@@ -74,7 +74,6 @@ FALLBACK_RANKING: dict[str, int] = {
 }
 
 async def fetch_hltv_ranking(session: aiohttp.ClientSession) -> dict[str, int]:
-"""Parse HLTV world ranking. Falls back to hardcoded dict on any failure."""
 headers = {
 "User-Agent": (
 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "

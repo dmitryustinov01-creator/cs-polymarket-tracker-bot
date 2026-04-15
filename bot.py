@@ -25,46 +25,41 @@ known_market_ids = set()
 is_first_run = True
 hltv_ranking = {}
 hltv_last_updated = None
+cs2_tag_ids = []
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 
+CS_FILTER_WORDS = [
+    "counter-strike", "cs2", "cs:go", "csgo",
+    "vitality", "navi", "natus vincere", "faze", "g2", "astralis",
+    "team liquid", "spirit", "heroic", "mouz", "nip", "ence",
+    "blast", "iem", "pgl", "esl", "faceit",
+    "b8", "betboom", "parivision", "aurora", "3dmax", "fnatic",
+    "cloud9", "complexity", "virtus", "apeks", "saw", "monte",
+    "m0nesy", "zywoo", "electronic", "sh1ro", "donk", "b1t"
+]
+
 FALLBACK_RANKING = {
-    "vitality": 1,
-    "natus vincere": 2,
-    "navi": 2,
-    "faze": 3,
-    "faze clan": 3,
-    "g2": 4,
-    "g2 esports": 4,
-    "spirit": 5,
-    "team spirit": 5,
-    "liquid": 6,
-    "team liquid": 6,
-    "mouz": 7,
-    "heroic": 8,
-    "astralis": 9,
-    "nip": 10,
-    "complexity": 11,
-    "ence": 12,
-    "cloud9": 13,
-    "big": 14,
-    "eternal fire": 15,
-    "fnatic": 16,
-    "pain": 17,
-    "3dmax": 18,
-    "mibr": 19,
-    "virtus.pro": 21,
-    "flyquest": 22,
-    "monte": 23,
-    "saw": 24,
-    "apeks": 25,
-    "b8": 26,
-    "betboom": 27,
-    "betboom team": 27,
-    "parivision": 28,
-    "100 thieves": 29,
-    "aurora": 30,
+    "vitality": 1, "natus vincere": 2, "navi": 2,
+    "faze": 3, "faze clan": 3, "g2": 4, "g2 esports": 4,
+    "spirit": 5, "team spirit": 5, "liquid": 6, "team liquid": 6,
+    "mouz": 7, "heroic": 8, "astralis": 9, "nip": 10,
+    "complexity": 11, "ence": 12, "cloud9": 13, "big": 14,
+    "eternal fire": 15, "fnatic": 16, "pain": 17, "3dmax": 18,
+    "mibr": 19, "virtus.pro": 21, "flyquest": 22, "monte": 23,
+    "saw": 24, "apeks": 25, "b8": 26, "betboom": 27,
+    "betboom team": 27, "parivision": 28, "aurora": 29,
+    "100 thieves": 30,
 }
+
+
+def is_cs_market(market):
+    text = (
+        market.get("question", "") + " " +
+        market.get("description", "") + " " +
+        market.get("groupItemTitle", "")
+    ).lower()
+    return any(w in text for w in CS_FILTER_WORDS)
 
 
 def get_price(market, idx):
@@ -95,12 +90,13 @@ def market_url(market):
 
 
 def get_team_rank(name):
-    if not name or not hltv_ranking:
+    if not name:
         return ""
+    ranking = hltv_ranking if hltv_ranking else FALLBACK_RANKING
     n = name.strip().lower()
-    if n in hltv_ranking:
-        return "#" + str(hltv_ranking[n])
-    for key, rank in hltv_ranking.items():
+    if n in ranking:
+        return "#" + str(ranking[n])
+    for key, rank in ranking.items():
         if key in n or n in key:
             return "#" + str(rank)
     return ""
@@ -111,7 +107,7 @@ def extract_teams(market):
         raw = market.get("outcomes", "[]")
         outcomes = json.loads(raw) if isinstance(raw, str) else raw
         teams = [str(o).strip() for o in outcomes
-                 if str(o).strip().lower() not in ("yes", "no", "draw", "other")]
+                 if str(o).strip().lower() not in ("yes", "no", "draw", "other", "neither")]
         if teams:
             return teams[:2]
     except Exception:
@@ -156,7 +152,7 @@ def new_market_text(market):
 
 def list_text(markets):
     if not markets:
-        return "No active CS2 markets found."
+        return "No active CS2 markets found on Polymarket."
     lines = ["<b>CS2 markets on Polymarket:</b>\n"]
     for m in markets[:15]:
         q = m.get("question", "?")[:60]
@@ -170,21 +166,17 @@ def list_text(markets):
 
 async def fetch_hltv(session):
     ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    headers = {"User-Agent": ua, "Accept-Language": "en-US,en;q=0.9"}
     try:
         async with session.get(
             "https://www.hltv.org/ranking/teams",
-            headers=headers,
+            headers={"User-Agent": ua, "Accept-Language": "en-US,en;q=0.9"},
             timeout=aiohttp.ClientTimeout(total=15),
         ) as r:
             if r.status != 200:
                 return FALLBACK_RANKING.copy()
             html = await r.text()
             ranking = {}
-            blocks = re.findall(
-                r'class="position">#(\d+).*?class="name">(.*?)<',
-                html, re.DOTALL
-            )
+            blocks = re.findall(r'class="position">#(\d+).*?class="name">(.*?)<', html, re.DOTALL)
             for rank_str, name_raw in blocks:
                 name = re.sub(r"<[^>]+>", "", name_raw).strip().lower()
                 try:
@@ -199,79 +191,99 @@ async def fetch_hltv(session):
 async def refresh_hltv(session):
     global hltv_ranking, hltv_last_updated
     now = datetime.now(timezone.utc)
-    stale = (
-        not hltv_ranking
-        or hltv_last_updated is None
-        or (now - hltv_last_updated).total_seconds() > HLTV_UPDATE_INTERVAL
-    )
-    if stale:
+    if (not hltv_ranking or hltv_last_updated is None or
+            (now - hltv_last_updated).total_seconds() > HLTV_UPDATE_INTERVAL):
         hltv_ranking = await fetch_hltv(session)
         hltv_last_updated = now
         log.info("HLTV updated: %d teams", len(hltv_ranking))
 
 
+async def find_cs2_tag_ids(session):
+    global cs2_tag_ids
+    try:
+        async with session.get(
+            GAMMA_API + "/tags",
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as r:
+            if r.status == 200:
+                tags = await r.json()
+                found = []
+                for t in tags:
+                    label = (t.get("label", "") + " " + t.get("slug", "")).lower()
+                    if any(w in label for w in ["cs2", "counter-strike", "counter strike", "csgo"]):
+                        found.append(str(t.get("id", "")))
+                        log.info("Found CS tag: %s id=%s", t.get("label"), t.get("id"))
+                if found:
+                    cs2_tag_ids = found
+                    return
+    except Exception as e:
+        log.warning("Tag search failed: %s", e)
+
+
 async def fetch_markets(session):
     results = []
 
-    # Method 1: tag_slug=cs2
-    try:
-        params = {"tag_slug": "cs2", "active": "true", "closed": "false", "limit": "100"}
-        async with session.get(
-            GAMMA_API + "/markets",
-            params=params,
-            timeout=aiohttp.ClientTimeout(total=20),
-        ) as r:
-            if r.status == 200:
-                data = await r.json()
-                items = data if isinstance(data, list) else data.get("markets", [])
-                results.extend(items)
-                log.info("tag cs2: %d markets", len(items))
-    except Exception as e:
-        log.warning("tag cs2 failed: %s", e)
-
-    # Method 2: tag_slug=counter-strike
-    try:
-        params = {"tag_slug": "counter-strike", "active": "true", "closed": "false", "limit": "100"}
-        async with session.get(
-            GAMMA_API + "/markets",
-            params=params,
-            timeout=aiohttp.ClientTimeout(total=20),
-        ) as r:
-            if r.status == 200:
-                data = await r.json()
-                items = data if isinstance(data, list) else data.get("markets", [])
-                results.extend(items)
-                log.info("tag counter-strike: %d markets", len(items))
-    except Exception as e:
-        log.warning("tag counter-strike failed: %s", e)
-
-    # Method 3: search by keyword
-    for kw in ["counter-strike", "cs2"]:
+    # Method 1: by CS2 tag IDs discovered from /tags endpoint
+    for tag_id in cs2_tag_ids:
         try:
-            params = {"_c": kw, "active": "true", "limit": "50"}
+            params = {"tag_id": tag_id, "active": "true", "closed": "false", "limit": "100"}
             async with session.get(
-                GAMMA_API + "/markets",
-                params=params,
+                GAMMA_API + "/markets", params=params,
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    items = data if isinstance(data, list) else data.get("markets", [])
+                    results.extend(items)
+                    log.info("tag_id %s: %d markets", tag_id, len(items))
+        except Exception as e:
+            log.warning("tag_id %s failed: %s", tag_id, e)
+
+    # Method 2: search via /events endpoint with CS2 filter
+    try:
+        params = {"active": "true", "closed": "false", "limit": "100", "order": "createdAt", "ascending": "false"}
+        async with session.get(
+            GAMMA_API + "/events", params=params,
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as r:
+            if r.status == 200:
+                data = await r.json()
+                events = data if isinstance(data, list) else data.get("events", data.get("data", []))
+                for event in events:
+                    title = (event.get("title", "") + " " + event.get("description", "")).lower()
+                    if any(w in title for w in CS_FILTER_WORDS):
+                        for m in event.get("markets", []):
+                            results.append(m)
+                log.info("events endpoint: checked %d events", len(events))
+    except Exception as e:
+        log.warning("events endpoint failed: %s", e)
+
+    # Method 3: direct market search by question keyword
+    for kw in ["counter-strike", "cs2 match", "vitality vs", "navi vs", "faze vs", "g2 vs"]:
+        try:
+            params = {"_c": kw, "active": "true", "closed": "false", "limit": "30"}
+            async with session.get(
+                GAMMA_API + "/markets", params=params,
                 timeout=aiohttp.ClientTimeout(total=15),
             ) as r:
                 if r.status == 200:
                     data = await r.json()
                     items = data if isinstance(data, list) else data.get("markets", [])
                     results.extend(items)
-                    log.info("keyword %s: %d markets", kw, len(items))
-        except Exception as e:
-            log.warning("keyword %s failed: %s", kw, e)
+        except Exception:
+            pass
 
-    # Deduplicate
+    # Deduplicate and filter
     seen = set()
     unique = []
     for m in results:
         mid = m.get("id")
         if mid and mid not in seen:
-            seen.add(mid)
-            unique.append(m)
+            if is_cs_market(m):
+                seen.add(mid)
+                unique.append(m)
 
-    log.info("Total unique CS2 markets: %d", len(unique))
+    log.info("Total unique CS2 markets after filter: %d", len(unique))
     return unique
 
 
@@ -279,9 +291,12 @@ async def tracker():
     global is_first_run
     async with aiohttp.ClientSession() as session:
         await refresh_hltv(session)
+        await find_cs2_tag_ids(session)
         while True:
             try:
                 await refresh_hltv(session)
+                if not cs2_tag_ids:
+                    await find_cs2_tag_ids(session)
                 markets = await fetch_markets(session)
                 new_ones = []
                 for m in markets:
@@ -291,10 +306,10 @@ async def tracker():
                             new_ones.append(m)
                         known_market_ids.add(mid)
                 if is_first_run:
-                    log.info("First run: %d markets loaded", len(markets))
+                    log.info("First run: %d CS2 markets", len(markets))
                     is_first_run = False
                 else:
-                    log.info("Check done. Known: %d, New: %d", len(known_market_ids), len(new_ones))
+                    log.info("Check: known=%d new=%d", len(known_market_ids), len(new_ones))
                 for market in new_ones:
                     text = new_market_text(market)
                     kb = InlineKeyboardMarkup(inline_keyboard=[[
@@ -302,12 +317,8 @@ async def tracker():
                     ]])
                     for chat_id in list(subscribers):
                         try:
-                            await bot.send_message(
-                                chat_id, text,
-                                parse_mode="HTML",
-                                reply_markup=kb,
-                                disable_web_page_preview=True,
-                            )
+                            await bot.send_message(chat_id, text, parse_mode="HTML",
+                                                   reply_markup=kb, disable_web_page_preview=True)
                         except Exception as e:
                             log.warning("send error %d: %s", chat_id, e)
                             if "blocked" in str(e).lower() or "not found" in str(e).lower():
@@ -363,8 +374,7 @@ async def cmd_ranking(message: types.Message):
         if rank not in seen_ranks:
             seen_ranks.add(rank)
             lines.append("#" + str(rank) + " " + name.title())
-    src = "live" if hltv_ranking else "fallback"
-    lines.append("\nSource: " + src)
+    lines.append("\nSource: " + ("live HLTV" if hltv_ranking else "fallback"))
     await message.answer("\n".join(lines), parse_mode="HTML")
 
 
@@ -376,6 +386,7 @@ async def cmd_status(message: types.Message):
         "Subscribed: " + subbed + "\n"
         "Known markets: " + str(len(known_market_ids)) + "\n"
         "HLTV teams: " + str(len(hltv_ranking)) + "\n"
+        "CS2 tag IDs found: " + str(cs2_tag_ids) + "\n"
         "Interval: " + str(CHECK_INTERVAL) + "s",
         parse_mode="HTML",
     )

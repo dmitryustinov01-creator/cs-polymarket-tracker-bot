@@ -27,11 +27,6 @@ hltv_ranking = {}
 hltv_last_updated = None
 
 GAMMA_API = "https://gamma-api.polymarket.com"
-CLOB_API = "https://clob.polymarket.com"
-
-CS2_IDENTIFIERS = [
-    "counter-strike", "cs2", "csgo", "cs:go"
-]
 
 WINNER_EXCLUDE = [
     "map 1", "map 2", "map 3", "map 4", "map 5",
@@ -39,7 +34,7 @@ WINNER_EXCLUDE = [
     "half", "round", "first blood", "first kill",
     "overtime", "ace", "bomb", "most kills", "most damage",
     "first to", "rating", "mvp", "reach", "handicap",
-    "what will be said", "which maps", "roster"
+    "what will be said", "which maps", "roster", "winner"
 ]
 
 FALLBACK_RANKING = {
@@ -57,21 +52,30 @@ FALLBACK_RANKING = {
 }
 
 
-def is_cs_market(market):
-    text = (
-        market.get("question", "") + " " +
-        market.get("title", "") + " " +
-        market.get("description", "") + " " +
-        market.get("slug", "") + " " +
-        market.get("conditionId", "")
-    ).lower()
-    return any(w in text for w in CS2_IDENTIFIERS)
-
-
 def is_winner_market(market):
-    question = (market.get("question", "") or market.get("title", "")).lower()
+    """Только рынки про победителя матча — без карт, раундов, турнирных победителей."""
+    question = market.get("question", "").lower()
+    # Исключаем по стоп-словам
     if any(w in question for w in WINNER_EXCLUDE):
         return False
+    # Должно содержать "vs" — это матч между двумя командами
+    if " vs " not in question and " vs. " not in question:
+        return False
+    return True
+
+
+def is_active_market(market):
+    """Только активные незакрытые рынки."""
+    if market.get("closed") or market.get("archived"):
+        return False
+    end_raw = market.get("endDate", "")
+    if end_raw:
+        try:
+            end = datetime.fromisoformat(end_raw.replace("Z", "+00:00"))
+            if end < datetime.now(timezone.utc):
+                return False
+        except Exception:
+            pass
     return True
 
 
@@ -87,7 +91,7 @@ def get_price(market, idx):
 
 def format_volume(market):
     try:
-        v = float(market.get("volume", 0) or market.get("volume24hr", 0) or 0)
+        v = float(market.get("volume", 0) or 0)
         if v >= 1000000:
             return "$" + str(round(v / 1000000, 1)) + "M"
         if v >= 1000:
@@ -145,9 +149,9 @@ def matchup_line(market):
 
 
 def new_market_text(market):
-    question = market.get("question", market.get("title", "?"))
+    question = market.get("question", "?")
     volume = format_volume(market)
-    end_raw = market.get("endDate", market.get("end_date_iso", ""))
+    end_raw = market.get("endDate", "")
     try:
         end_date = datetime.fromisoformat(end_raw.replace("Z", "+00:00")).strftime("%d.%m.%Y")
     except Exception:
@@ -168,7 +172,7 @@ def list_text(markets):
         return "No active CS2 markets found on Polymarket."
     lines = ["<b>CS2 markets on Polymarket:</b>\n"]
     for m in markets[:15]:
-        q = (m.get("question") or m.get("title", "?"))[:60]
+        q = m.get("question", "?")[:60]
         url = market_url(m)
         line = matchup_line(m)
         lines.append("- <a href=\"" + url + "\">" + q + "</a>\n  " + line)
@@ -211,98 +215,66 @@ async def refresh_hltv(session):
         log.info("HLTV updated: %d teams", len(hltv_ranking))
 
 
-async def fetch_from_clob(session):
-    """Пробуем CLOB API — содержит все рынки включая esports."""
-    results = []
-    try:
-        # CLOB markets endpoint
-        next_cursor = ""
-        pages = 0
-        while pages < 10:
-            params = {"active": "true", "closed": "false", "limit": "500"}
-            if next_cursor:
-                params["next_cursor"] = next_cursor
+async def fetch_cs2_events(session):
+    """Тянем события по tag_slug=counter-strike — работает!"""
+    all_markets = []
+    offset = 0
+    limit = 100
+
+    while True:
+        try:
+            params = {
+                "tag_slug": "counter-strike",
+                "active": "true",
+                "closed": "false",
+                "limit": str(limit),
+                "offset": str(offset),
+                "order": "endDate",
+                "ascending": "true"
+            }
             async with session.get(
-                CLOB_API + "/markets", params=params,
+                GAMMA_API + "/events", params=params,
                 timeout=aiohttp.ClientTimeout(total=20),
             ) as r:
                 if r.status != 200:
-                    log.warning("CLOB status %d", r.status)
+                    log.warning("fetch_cs2_events status %d", r.status)
                     break
                 data = await r.json()
-                items = data.get("data", [])
-                for m in items:
-                    if is_cs_market(m):
-                        results.append(m)
-                log.info("CLOB page %d: %d markets, %d CS2", pages, len(items), len(results))
-                next_cursor = data.get("next_cursor", "")
-                if not next_cursor or not items:
+                events = data if isinstance(data, list) else data.get("events", data.get("data", []))
+
+                if not events:
                     break
-                pages += 1
-    except Exception as e:
-        log.warning("CLOB fetch failed: %s", e)
-    return results
 
+                for event in events:
+                    for m in event.get("markets", []):
+                        all_markets.append(m)
 
-async def fetch_from_gamma_esports(session):
-    """Пробуем gamma API с category/tag параметрами для esports."""
-    results = []
+                log.info("CS2 events offset=%d: %d events", offset, len(events))
 
-    # Попытки с разными параметрами
-    attempts = [
-        {"category": "esports", "active": "true", "closed": "false", "limit": "200"},
-        {"category": "Sports", "active": "true", "closed": "false", "limit": "200"},
-        {"tag_slug": "esports", "active": "true", "closed": "false", "limit": "200"},
-        {"tag_slug": "counter-strike", "active": "true", "closed": "false", "limit": "200"},
-        {"tag_slug": "cs2", "active": "true", "closed": "false", "limit": "200"},
-    ]
+                if len(events) < limit:
+                    break
+                offset += limit
 
-    for params in attempts:
-        try:
-            async with session.get(
-                GAMMA_API + "/events", params=params,
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as r:
-                if r.status == 200:
-                    data = await r.json()
-                    events = data if isinstance(data, list) else data.get("events", data.get("data", []))
-                    for event in events:
-                        title = (event.get("title", "") + event.get("slug", "")).lower()
-                        if any(w in title for w in CS2_IDENTIFIERS):
-                            for m in event.get("markets", []):
-                                results.append(m)
-                    if results:
-                        log.info("Gamma esports params %s: found %d CS2", params, len(results))
-                        break
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("fetch_cs2_events failed: %s", e)
+            break
 
-    return results
+    return all_markets
 
 
 async def fetch_markets(session):
-    results = []
+    raw = await fetch_cs2_events(session)
 
-    # Метод 1: CLOB API (содержит все рынки)
-    clob_results = await fetch_from_clob(session)
-    results.extend(clob_results)
-
-    # Метод 2: Gamma с esports параметрами
-    if not results:
-        gamma_results = await fetch_from_gamma_esports(session)
-        results.extend(gamma_results)
-
-    # Дедупликация и фильтрация
     seen = set()
     unique = []
-    for m in results:
-        mid = m.get("id") or m.get("condition_id")
+    for m in raw:
+        mid = m.get("id")
         if mid and mid not in seen:
-            if is_cs_market(m) and is_winner_market(m):
+            if is_winner_market(m) and is_active_market(m):
                 seen.add(mid)
                 unique.append(m)
 
-    log.info("Total unique CS2 winner markets: %d", len(unique))
+    log.info("CS2 winner markets (active): %d", len(unique))
     return unique
 
 
@@ -316,13 +288,13 @@ async def tracker():
                 markets = await fetch_markets(session)
                 new_ones = []
                 for m in markets:
-                    mid = str(m.get("id") or m.get("condition_id", ""))
+                    mid = str(m.get("id", ""))
                     if mid and mid not in known_market_ids:
                         if not is_first_run:
                             new_ones.append(m)
                         known_market_ids.add(mid)
                 if is_first_run:
-                    log.info("First run: %d CS2 winner markets", len(markets))
+                    log.info("First run: %d CS2 markets loaded", len(markets))
                     is_first_run = False
                 else:
                     log.info("Check: known=%d new=%d", len(known_market_ids), len(new_ones))
@@ -354,12 +326,11 @@ async def cmd_start(message: types.Message):
     await message.answer(
         "<b>CS2 Polymarket Tracker</b>\n\n"
         "Tracking new CS2 markets on Polymarket.\n"
-        "You will get a notification when a new market appears.\n"
+        "You will get a notification when a new match market appears.\n"
         "Check interval: " + str(CHECK_INTERVAL // 60) + " min\n\n"
-        "/list - current CS2 markets\n"
+        "/list - current CS2 match markets\n"
         "/ranking - HLTV top 20\n"
         "/status - bot status\n"
-        "/debug - API diagnostics\n"
         "/stop - unsubscribe",
         parse_mode="HTML",
         reply_markup=kb,
@@ -406,87 +377,6 @@ async def cmd_status(message: types.Message):
         "Interval: " + str(CHECK_INTERVAL) + "s",
         parse_mode="HTML",
     )
-
-
-@dp.message(Command("debug"))
-async def cmd_debug(message: types.Message):
-    msg = await message.answer("Running diagnostics (20-30s)...")
-    lines = ["<b>API Debug v4</b>\n"]
-
-    async with aiohttp.ClientSession() as session:
-
-        # Тест 1: CLOB API /markets
-        try:
-            async with session.get(
-                CLOB_API + "/markets",
-                params={"active": "true", "limit": "5"},
-                timeout=aiohttp.ClientTimeout(total=15)
-            ) as r:
-                lines.append("CLOB /markets status: <b>" + str(r.status) + "</b>")
-                if r.status == 200:
-                    data = await r.json()
-                    items = data.get("data", data if isinstance(data, list) else [])
-                    cs = [m for m in items if is_cs_market(m)]
-                    lines.append("Items: " + str(len(items)) + ", CS2: " + str(len(cs)))
-                    if items:
-                        sample = items[0]
-                        lines.append("Keys: " + str(list(sample.keys()))[:100])
-                        lines.append("Sample: " + str(sample.get("question", sample.get("market_slug", "?")))[:60])
-        except Exception as e:
-            lines.append("CLOB test failed: " + str(e)[:80])
-
-        # Тест 2: Gamma /events с category=esports
-        for cat in ["esports", "Esports", "sports", "Sports"]:
-            try:
-                async with session.get(
-                    GAMMA_API + "/events",
-                    params={"category": cat, "active": "true", "limit": "5"},
-                    timeout=aiohttp.ClientTimeout(total=10)
-                ) as r:
-                    if r.status == 200:
-                        data = await r.json()
-                        events = data if isinstance(data, list) else data.get("events", data.get("data", []))
-                        if events:
-                            lines.append("\nGamma category='" + cat + "': <b>" + str(len(events)) + " events</b>")
-                            for e in events[:3]:
-                                lines.append("  • " + e.get("title", "?")[:50])
-                            break
-            except Exception:
-                pass
-
-        # Тест 3: Gamma /events с tag_slug
-        for slug in ["esports", "counter-strike", "cs2", "gaming"]:
-            try:
-                async with session.get(
-                    GAMMA_API + "/events",
-                    params={"tag_slug": slug, "active": "true", "limit": "5"},
-                    timeout=aiohttp.ClientTimeout(total=10)
-                ) as r:
-                    if r.status == 200:
-                        data = await r.json()
-                        events = data if isinstance(data, list) else data.get("events", data.get("data", []))
-                        if events:
-                            lines.append("\nGamma tag_slug='" + slug + "': <b>" + str(len(events)) + "</b>")
-                            for e in events[:2]:
-                                lines.append("  • " + e.get("title", "?")[:50])
-            except Exception:
-                pass
-
-        # Тест 4: Polymarket strapi/internal API
-        try:
-            async with session.get(
-                "https://polymarket.com/api/events",
-                params={"category": "esports", "limit": "5"},
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as r:
-                lines.append("\nPolymarket /api/events status: " + str(r.status))
-        except Exception as e:
-            lines.append("\nPolymarket API: " + str(e)[:60])
-
-    text = "\n".join(lines)
-    if len(text) > 4000:
-        text = text[:4000] + "..."
-    await msg.edit_text(text, parse_mode="HTML")
 
 
 @dp.callback_query(lambda c: c.data == "list")

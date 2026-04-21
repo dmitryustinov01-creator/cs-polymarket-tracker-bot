@@ -29,18 +29,30 @@ cs2_tag_ids = []
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 
-# Только явные CS2 идентификаторы — без названий команд
 CS2_IDENTIFIERS = [
     "counter-strike", "cs2", "csgo", "cs:go"
 ]
 
-# Исключаем всё что не про победителя матча/серии
 WINNER_EXCLUDE = [
     "map 1", "map 2", "map 3", "map 4", "map 5",
     "first map", "pistol", "knife round", "total maps",
     "half", "round", "first blood", "first kill",
     "overtime", "ace", "bomb", "most kills", "most damage",
-    "first to", "rating", "mvp", "reach"
+    "first to", "rating", "mvp", "reach", "handicap",
+    "what will be said", "which maps", "roster"
+]
+
+CS2_SEARCH_KEYWORDS = [
+    "Counter-Strike",
+    "counter-strike",
+    "cs2",
+]
+
+CS2_TOURNAMENTS = [
+    "IEM Rio", "IEM Cologne", "IEM Katowice", "IEM Dallas",
+    "BLAST Premier", "BLAST Open", "BLAST Finals",
+    "PGL Major", "ESL Pro League", "CCT", "NODWIN",
+    "Parken Challenger", "Conquest of Prague"
 ]
 
 FALLBACK_RANKING = {
@@ -53,22 +65,23 @@ FALLBACK_RANKING = {
     "mibr": 19, "virtus.pro": 21, "flyquest": 22, "monte": 23,
     "saw": 24, "apeks": 25, "b8": 26, "betboom": 27,
     "betboom team": 27, "parivision": 28, "aurora": 29,
-    "100 thieves": 30,
+    "100 thieves": 30, "falcons": 31, "team falcons": 31,
+    "furia": 32,
 }
 
 
 def is_cs_market(market):
-    """Только рынки с явным упоминанием CS2/Counter-Strike."""
     text = (
         market.get("question", "") + " " +
         market.get("description", "") + " " +
-        market.get("groupItemTitle", "")
+        market.get("groupItemTitle", "") + " " +
+        market.get("category", "") + " " +
+        market.get("slug", "")
     ).lower()
     return any(w in text for w in CS2_IDENTIFIERS)
 
 
 def is_winner_market(market):
-    """Только рынки про победителя матча/серии — без карт, раундов и т.д."""
     question = market.get("question", "").lower()
     if any(w in question for w in WINNER_EXCLUDE):
         return False
@@ -223,12 +236,14 @@ async def find_cs2_tag_ids(session):
                 found = []
                 for t in tags:
                     label = (t.get("label", "") + " " + t.get("slug", "")).lower()
-                    if any(w in label for w in ["cs2", "counter-strike", "counter strike", "csgo"]):
+                    if any(w in label for w in ["cs2", "counter-strike", "counter strike", "csgo", "esport"]):
                         found.append(str(t.get("id", "")))
-                        log.info("Found CS tag: %s id=%s", t.get("label"), t.get("id"))
+                        log.info("Found tag: %s id=%s", t.get("label"), t.get("id"))
                 if found:
                     cs2_tag_ids = found
-                    return
+                else:
+                    log.info("No CS2 tags. Available: %s",
+                             [(t.get("label"), t.get("id")) for t in tags[:20]])
     except Exception as e:
         log.warning("Tag search failed: %s", e)
 
@@ -236,7 +251,7 @@ async def find_cs2_tag_ids(session):
 async def fetch_markets(session):
     results = []
 
-    # Method 1: by CS2 tag IDs discovered from /tags endpoint
+    # Method 1: по тег ID
     for tag_id in cs2_tag_ids:
         try:
             params = {"tag_id": tag_id, "active": "true", "closed": "false", "limit": "100"}
@@ -252,29 +267,10 @@ async def fetch_markets(session):
         except Exception as e:
             log.warning("tag_id %s failed: %s", tag_id, e)
 
-    # Method 2: search via /events endpoint with CS2 filter
-    try:
-        params = {"active": "true", "closed": "false", "limit": "100", "order": "createdAt", "ascending": "false"}
-        async with session.get(
-            GAMMA_API + "/events", params=params,
-            timeout=aiohttp.ClientTimeout(total=20),
-        ) as r:
-            if r.status == 200:
-                data = await r.json()
-                events = data if isinstance(data, list) else data.get("events", data.get("data", []))
-                for event in events:
-                    title = (event.get("title", "") + " " + event.get("description", "")).lower()
-                    if any(w in title for w in CS2_IDENTIFIERS):
-                        for m in event.get("markets", []):
-                            results.append(m)
-                log.info("events endpoint: checked %d events", len(events))
-    except Exception as e:
-        log.warning("events endpoint failed: %s", e)
-
-    # Method 3: direct market search by keyword
-    for kw in ["counter-strike", "cs2 match"]:
+    # Method 2: поиск по ключевым словам
+    for kw in CS2_SEARCH_KEYWORDS:
         try:
-            params = {"_c": kw, "active": "true", "closed": "false", "limit": "30"}
+            params = {"_c": kw, "active": "true", "closed": "false", "limit": "100"}
             async with session.get(
                 GAMMA_API + "/markets", params=params,
                 timeout=aiohttp.ClientTimeout(total=15),
@@ -283,10 +279,58 @@ async def fetch_markets(session):
                     data = await r.json()
                     items = data if isinstance(data, list) else data.get("markets", [])
                     results.extend(items)
+                    log.info("keyword '%s': %d markets", kw, len(items))
+        except Exception as e:
+            log.warning("keyword '%s' failed: %s", kw, e)
+
+    # Method 3: /events с пагинацией
+    for offset in [0, 100, 200]:
+        try:
+            params = {
+                "active": "true", "closed": "false",
+                "limit": "100", "offset": str(offset),
+                "order": "volume", "ascending": "false"
+            }
+            async with session.get(
+                GAMMA_API + "/events", params=params,
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    events = data if isinstance(data, list) else data.get("events", data.get("data", []))
+                    cs_count = 0
+                    for event in events:
+                        title = (
+                            event.get("title", "") + " " +
+                            event.get("description", "") + " " +
+                            event.get("slug", "")
+                        ).lower()
+                        if any(w in title for w in CS2_IDENTIFIERS):
+                            for m in event.get("markets", []):
+                                results.append(m)
+                            cs_count += 1
+                    log.info("events offset=%d: %d events, %d CS2", offset, len(events), cs_count)
+        except Exception as e:
+            log.warning("events offset=%d failed: %s", offset, e)
+
+    # Method 4: по турнирам
+    for tournament in CS2_TOURNAMENTS:
+        try:
+            params = {"_c": tournament, "active": "true", "closed": "false", "limit": "50"}
+            async with session.get(
+                GAMMA_API + "/markets", params=params,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    items = data if isinstance(data, list) else data.get("markets", [])
+                    if items:
+                        results.extend(items)
+                        log.info("tournament '%s': %d markets", tournament, len(items))
         except Exception:
             pass
 
-    # Deduplicate, filter by CS2 AND winner-only
+    # Дедупликация и фильтрация
     seen = set()
     unique = []
     for m in results:
@@ -296,7 +340,7 @@ async def fetch_markets(session):
                 seen.add(mid)
                 unique.append(m)
 
-    log.info("Total unique CS2 winner markets after filter: %d", len(unique))
+    log.info("Total unique CS2 winner markets: %d", len(unique))
     return unique
 
 
@@ -356,6 +400,7 @@ async def cmd_start(message: types.Message):
         "/list - current CS2 markets\n"
         "/ranking - HLTV top 20\n"
         "/status - bot status\n"
+        "/debug - API diagnostics\n"
         "/stop - unsubscribe",
         parse_mode="HTML",
         reply_markup=kb,
@@ -403,6 +448,57 @@ async def cmd_status(message: types.Message):
         "Interval: " + str(CHECK_INTERVAL) + "s",
         parse_mode="HTML",
     )
+
+
+@dp.message(Command("debug"))
+async def cmd_debug(message: types.Message):
+    """Диагностика: что реально возвращает API."""
+    msg = await message.answer("Running API diagnostics...")
+    lines = ["<b>API Debug</b>\n"]
+
+    async with aiohttp.ClientSession() as session:
+        # Тест 1: keyword search
+        try:
+            params = {"_c": "Counter-Strike", "active": "true", "closed": "false", "limit": "5"}
+            async with session.get(GAMMA_API + "/markets", params=params,
+                                   timeout=aiohttp.ClientTimeout(total=15)) as r:
+                data = await r.json()
+                items = data if isinstance(data, list) else data.get("markets", [])
+                lines.append("Search 'Counter-Strike': <b>" + str(len(items)) + " results</b>")
+                for item in items[:3]:
+                    lines.append("  • " + item.get("question", "?")[:55])
+        except Exception as e:
+            lines.append("Search test failed: " + str(e))
+
+        # Тест 2: top events
+        try:
+            params = {"active": "true", "closed": "false", "limit": "10",
+                      "order": "volume", "ascending": "false"}
+            async with session.get(GAMMA_API + "/events", params=params,
+                                   timeout=aiohttp.ClientTimeout(total=15)) as r:
+                data = await r.json()
+                events = data if isinstance(data, list) else data.get("events", data.get("data", []))
+                lines.append("\nTop events (" + str(len(events)) + "):")
+                for e in events[:5]:
+                    lines.append("  • " + e.get("title", "?")[:50])
+        except Exception as e:
+            lines.append("Events test failed: " + str(e))
+
+        # Тест 3: теги
+        try:
+            async with session.get(GAMMA_API + "/tags",
+                                   timeout=aiohttp.ClientTimeout(total=10)) as r:
+                tags = await r.json()
+                lines.append("\nFirst 10 tags:")
+                for t in tags[:10]:
+                    lines.append("  " + str(t.get("id")) + ": " + t.get("label", "?"))
+        except Exception as e:
+            lines.append("Tags test failed: " + str(e))
+
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:4000] + "..."
+    await msg.edit_text(text, parse_mode="HTML")
 
 
 @dp.callback_query(lambda c: c.data == "list")

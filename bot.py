@@ -29,14 +29,18 @@ cs2_tag_ids = []
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 
-CS_FILTER_WORDS = [
-    "counter-strike", "cs2", "cs:go", "csgo",
-    "vitality", "navi", "natus vincere", "faze", "g2", "astralis",
-    "team liquid", "spirit", "heroic", "mouz", "nip", "ence",
-    "blast", "iem", "pgl", "esl", "faceit",
-    "b8", "betboom", "parivision", "aurora", "3dmax", "fnatic",
-    "cloud9", "complexity", "virtus", "apeks", "saw", "monte",
-    "m0nesy", "zywoo", "electronic", "sh1ro", "donk", "b1t"
+# Только явные CS2 идентификаторы — без названий команд
+CS2_IDENTIFIERS = [
+    "counter-strike", "cs2", "csgo", "cs:go"
+]
+
+# Исключаем всё что не про победителя матча/серии
+WINNER_EXCLUDE = [
+    "map 1", "map 2", "map 3", "map 4", "map 5",
+    "first map", "pistol", "knife round", "total maps",
+    "half", "round", "first blood", "first kill",
+    "overtime", "ace", "bomb", "most kills", "most damage",
+    "first to", "rating", "mvp", "reach"
 ]
 
 FALLBACK_RANKING = {
@@ -54,12 +58,21 @@ FALLBACK_RANKING = {
 
 
 def is_cs_market(market):
+    """Только рынки с явным упоминанием CS2/Counter-Strike."""
     text = (
         market.get("question", "") + " " +
         market.get("description", "") + " " +
         market.get("groupItemTitle", "")
     ).lower()
-    return any(w in text for w in CS_FILTER_WORDS)
+    return any(w in text for w in CS2_IDENTIFIERS)
+
+
+def is_winner_market(market):
+    """Только рынки про победителя матча/серии — без карт, раундов и т.д."""
+    question = market.get("question", "").lower()
+    if any(w in question for w in WINNER_EXCLUDE):
+        return False
+    return True
 
 
 def get_price(market, idx):
@@ -251,15 +264,15 @@ async def fetch_markets(session):
                 events = data if isinstance(data, list) else data.get("events", data.get("data", []))
                 for event in events:
                     title = (event.get("title", "") + " " + event.get("description", "")).lower()
-                    if any(w in title for w in CS_FILTER_WORDS):
+                    if any(w in title for w in CS2_IDENTIFIERS):
                         for m in event.get("markets", []):
                             results.append(m)
                 log.info("events endpoint: checked %d events", len(events))
     except Exception as e:
         log.warning("events endpoint failed: %s", e)
 
-    # Method 3: direct market search by question keyword
-    for kw in ["counter-strike", "cs2 match", "vitality vs", "navi vs", "faze vs", "g2 vs"]:
+    # Method 3: direct market search by keyword
+    for kw in ["counter-strike", "cs2 match"]:
         try:
             params = {"_c": kw, "active": "true", "closed": "false", "limit": "30"}
             async with session.get(
@@ -273,17 +286,17 @@ async def fetch_markets(session):
         except Exception:
             pass
 
-    # Deduplicate and filter
+    # Deduplicate, filter by CS2 AND winner-only
     seen = set()
     unique = []
     for m in results:
         mid = m.get("id")
         if mid and mid not in seen:
-            if is_cs_market(m):
+            if is_cs_market(m) and is_winner_market(m):
                 seen.add(mid)
                 unique.append(m)
 
-    log.info("Total unique CS2 markets after filter: %d", len(unique))
+    log.info("Total unique CS2 winner markets after filter: %d", len(unique))
     return unique
 
 
@@ -306,7 +319,7 @@ async def tracker():
                             new_ones.append(m)
                         known_market_ids.add(mid)
                 if is_first_run:
-                    log.info("First run: %d CS2 markets", len(markets))
+                    log.info("First run: %d CS2 winner markets", len(markets))
                     is_first_run = False
                 else:
                     log.info("Check: known=%d new=%d", len(known_market_ids), len(new_ones))

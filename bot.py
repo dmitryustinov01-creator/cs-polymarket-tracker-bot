@@ -28,19 +28,16 @@ hltv_last_updated = None
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 
-# Стоп-слова для вопроса рынка
-WINNER_EXCLUDE = [
+# Стоп-слова — только самые очевидные
+EXCLUDE_WORDS = [
     "map 1", "map 2", "map 3", "map 4", "map 5",
-    "first map", "pistol", "knife", "total maps",
-    "games total", "o/u", "over/under",
-    "half", "round", "first blood", "first kill",
-    "overtime", "ace", "bomb", "most kills", "most damage",
-    "first to", "rating", "mvp", "reach", "handicap",
-    "what will be said", "which maps", "roster",
-    # Проп-беты и другие не-матчевые
-    "signs for", "signs with", "join", "retire", "transfer",
-    "win the", "qualify", "make it", "advance",
-    "winner", "champion", "playoff",
+    "first map", "pistol", "knife",
+    "games total", "o/u",
+    "round", "first blood", "first kill",
+    "ace", "bomb", "most kills",
+    "handicap",
+    "signs for", "signs with",
+    "will speed", "will ronaldo",
 ]
 
 FALLBACK_RANKING = {
@@ -59,39 +56,22 @@ FALLBACK_RANKING = {
 
 
 def is_match_market(market):
-    """
-    Только матчевые рынки: вопрос содержит 'vs' и не содержит стоп-слов.
-    Также проверяем что рынок не завершён (нет цен 0c/100c).
-    """
+    """Матч двух команд: содержит 'vs', не содержит стоп-слов."""
     question = market.get("question", "").lower()
 
-    # Должно быть "vs" — это матч двух команд
+    # Должно быть "vs"
     if " vs " not in question and " vs. " not in question:
         return False
 
     # Стоп-слова
-    if any(w in question for w in WINNER_EXCLUDE):
+    if any(w in question for w in EXCLUDE_WORDS):
         return False
-
-    # Исключаем уже завершённые рынки (одна сторона 0, другая 100)
-    try:
-        prices = market.get("outcomePrices", "[]")
-        if isinstance(prices, str):
-            prices = json.loads(prices)
-        if prices and len(prices) >= 2:
-            p0 = float(prices[0])
-            p1 = float(prices[1])
-            # Если одна цена равна 0 или 1 — матч завершён
-            if p0 <= 0.01 or p0 >= 0.99:
-                return False
-    except Exception:
-        pass
 
     return True
 
 
 def is_active_market(market):
-    """Только рынки с endDate в будущем."""
+    """Рынок ещё не закрыт и endDate в будущем."""
     if market.get("closed") or market.get("archived"):
         return False
     end_raw = market.get("endDate", "")
@@ -150,8 +130,8 @@ def extract_teams(market):
         raw = market.get("outcomes", "[]")
         outcomes = json.loads(raw) if isinstance(raw, str) else raw
         teams = [str(o).strip() for o in outcomes
-                 if str(o).strip().lower() not in ("yes", "no", "draw", "other",
-                                                    "neither", "over", "under")]
+                 if str(o).strip().lower() not in (
+                     "yes", "no", "draw", "other", "neither", "over", "under")]
         if teams:
             return teams[:2]
     except Exception:
@@ -271,7 +251,7 @@ async def fetch_markets(session):
                 for event in events:
                     for m in event.get("markets", []):
                         all_markets.append(m)
-                log.info("CS2 events offset=%d: %d events, %d markets total",
+                log.info("offset=%d: %d events, %d markets total",
                          offset, len(events), len(all_markets))
                 if len(events) < limit:
                     break
@@ -280,7 +260,6 @@ async def fetch_markets(session):
             log.warning("fetch_markets failed: %s", e)
             break
 
-    # Фильтрация
     seen = set()
     unique = []
     for m in all_markets:
@@ -310,7 +289,7 @@ async def tracker():
                             new_ones.append(m)
                         known_market_ids.add(mid)
                 if is_first_run:
-                    log.info("First run: %d CS2 match markets loaded", len(markets))
+                    log.info("First run: %d markets loaded", len(markets))
                     is_first_run = False
                 else:
                     log.info("Check: known=%d new=%d", len(known_market_ids), len(new_ones))
@@ -342,7 +321,6 @@ async def cmd_start(message: types.Message):
     await message.answer(
         "<b>🎮 CS2 Polymarket Tracker</b>\n\n"
         "Tracking new CS2 match markets on Polymarket.\n"
-        "Notification when a new match appears.\n"
         "Check interval: " + str(CHECK_INTERVAL // 60) + " min\n\n"
         "/list - current CS2 matches\n"
         "/ranking - HLTV top 20\n"

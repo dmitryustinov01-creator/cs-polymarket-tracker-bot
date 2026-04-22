@@ -53,7 +53,6 @@ FALLBACK_RANKING = {
 
 
 def is_resolved(market):
-    """Матч завершён — одна цена ровно 0, другая ровно 1."""
     try:
         prices = market.get("outcomePrices", "[]")
         if isinstance(prices, str):
@@ -69,21 +68,15 @@ def is_resolved(market):
 
 
 def is_match_market(market):
-    """Матч двух команд: содержит 'vs', не содержит стоп-слов, не завершён."""
     question = market.get("question", "").lower()
-
     if " vs " not in question and " vs. " not in question:
         return False
-
     if any(w in question for w in EXCLUDE_WORDS):
         return False
-
     if market.get("closed") or market.get("archived"):
         return False
-
     if is_resolved(market):
         return False
-
     return True
 
 
@@ -224,6 +217,31 @@ async def refresh_hltv(session):
         log.info("HLTV updated: %d teams", len(hltv_ranking))
 
 
+async def get_raw_events(session):
+    """Получить сырые события без фильтрации."""
+    try:
+        params = {
+            "tag_slug": "counter-strike",
+            "active": "true",
+            "closed": "false",
+            "limit": "20",
+            "offset": "0",
+            "order": "startDate",
+            "ascending": "false"
+        }
+        async with session.get(
+            GAMMA_API + "/events", params=params,
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as r:
+            if r.status != 200:
+                return [], r.status
+            data = await r.json()
+            events = data if isinstance(data, list) else data.get("events", data.get("data", []))
+            return events, r.status
+    except Exception as e:
+        return [], str(e)
+
+
 async def fetch_markets(session):
     all_markets = []
     offset = 0
@@ -264,22 +282,14 @@ async def fetch_markets(session):
 
     seen = set()
     unique = []
-    skipped_resolved = 0
-    skipped_other = 0
-
     for m in all_markets:
         mid = m.get("id")
         if mid and mid not in seen:
             seen.add(mid)
             if is_match_market(m):
                 unique.append(m)
-            elif is_resolved(m):
-                skipped_resolved += 1
-            else:
-                skipped_other += 1
 
-    log.info("Filter result: %d match markets, %d resolved skipped, %d other skipped",
-             len(unique), skipped_resolved, skipped_other)
+    log.info("After filter: %d match markets from %d total", len(unique), len(all_markets))
     return unique
 
 
@@ -335,6 +345,7 @@ async def cmd_start(message: types.Message):
         "/list - current CS2 matches\n"
         "/ranking - HLTV top 20\n"
         "/status - bot status\n"
+        "/raw - raw API data (debug)\n"
         "/stop - unsubscribe",
         parse_mode="HTML",
         reply_markup=kb,
@@ -354,6 +365,41 @@ async def cmd_list(message: types.Message):
         await refresh_hltv(session)
         markets = await fetch_markets(session)
     await msg.edit_text(list_text(markets), parse_mode="HTML", disable_web_page_preview=True)
+
+
+@dp.message(Command("raw"))
+async def cmd_raw(message: types.Message):
+    """Показать сырые данные API без фильтрации."""
+    msg = await message.answer("Fetching raw data...")
+    async with aiohttp.ClientSession() as session:
+        events, status = await get_raw_events(session)
+
+    lines = ["<b>Raw API (tag_slug=counter-strike)</b>\n",
+             "Status: " + str(status),
+             "Events returned: " + str(len(events)) + "\n"]
+
+    for i, event in enumerate(events[:5]):
+        lines.append("Event " + str(i+1) + ": " + event.get("title", "?")[:50])
+        markets = event.get("markets", [])
+        lines.append("  Markets: " + str(len(markets)))
+        for m in markets[:3]:
+            q = m.get("question", "?")[:50]
+            closed = m.get("closed", "?")
+            active = m.get("active", "?")
+            prices = m.get("outcomePrices", "[]")
+            try:
+                if isinstance(prices, str):
+                    prices = json.loads(prices)
+                prices_str = str([round(float(p), 2) for p in prices[:2]])
+            except Exception:
+                prices_str = str(prices)[:30]
+            lines.append("  • " + q)
+            lines.append("    closed=" + str(closed) + " active=" + str(active) + " prices=" + prices_str)
+
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:4000] + "..."
+    await msg.edit_text(text, parse_mode="HTML")
 
 
 @dp.message(Command("ranking"))

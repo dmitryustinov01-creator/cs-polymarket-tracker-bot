@@ -28,16 +28,13 @@ hltv_last_updated = None
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 
-# Стоп-слова — только самые очевидные
 EXCLUDE_WORDS = [
     "map 1", "map 2", "map 3", "map 4", "map 5",
     "first map", "pistol", "knife",
-    "games total", "o/u",
-    "round", "first blood", "first kill",
-    "ace", "bomb", "most kills",
-    "handicap",
+    "games total", "o/u", "over/under",
+    "first blood", "first kill", "ace", "bomb",
+    "most kills", "handicap",
     "signs for", "signs with",
-    "will speed", "will ronaldo",
 ]
 
 FALLBACK_RANKING = {
@@ -55,33 +52,38 @@ FALLBACK_RANKING = {
 }
 
 
+def is_resolved(market):
+    """Матч завершён — одна цена ровно 0, другая ровно 1."""
+    try:
+        prices = market.get("outcomePrices", "[]")
+        if isinstance(prices, str):
+            prices = json.loads(prices)
+        if prices and len(prices) >= 2:
+            p0 = round(float(prices[0]), 4)
+            p1 = round(float(prices[1]), 4)
+            if (p0 == 0.0 and p1 == 1.0) or (p0 == 1.0 and p1 == 0.0):
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def is_match_market(market):
-    """Матч двух команд: содержит 'vs', не содержит стоп-слов."""
+    """Матч двух команд: содержит 'vs', не содержит стоп-слов, не завершён."""
     question = market.get("question", "").lower()
 
-    # Должно быть "vs"
     if " vs " not in question and " vs. " not in question:
         return False
 
-    # Стоп-слова
     if any(w in question for w in EXCLUDE_WORDS):
         return False
 
-    return True
-
-
-def is_active_market(market):
-    """Рынок ещё не закрыт и endDate в будущем."""
     if market.get("closed") or market.get("archived"):
         return False
-    end_raw = market.get("endDate", "")
-    if end_raw:
-        try:
-            end = datetime.fromisoformat(end_raw.replace("Z", "+00:00"))
-            if end < datetime.now(timezone.utc):
-                return False
-        except Exception:
-            pass
+
+    if is_resolved(market):
+        return False
+
     return True
 
 
@@ -235,8 +237,8 @@ async def fetch_markets(session):
                 "closed": "false",
                 "limit": str(limit),
                 "offset": str(offset),
-                "order": "endDate",
-                "ascending": "true"
+                "order": "startDate",
+                "ascending": "false"
             }
             async with session.get(
                 GAMMA_API + "/events", params=params,
@@ -262,14 +264,22 @@ async def fetch_markets(session):
 
     seen = set()
     unique = []
+    skipped_resolved = 0
+    skipped_other = 0
+
     for m in all_markets:
         mid = m.get("id")
         if mid and mid not in seen:
-            if is_match_market(m) and is_active_market(m):
-                seen.add(mid)
+            seen.add(mid)
+            if is_match_market(m):
                 unique.append(m)
+            elif is_resolved(m):
+                skipped_resolved += 1
+            else:
+                skipped_other += 1
 
-    log.info("After filter: %d match markets", len(unique))
+    log.info("Filter result: %d match markets, %d resolved skipped, %d other skipped",
+             len(unique), skipped_resolved, skipped_other)
     return unique
 
 

@@ -28,6 +28,17 @@ hltv_last_updated = None
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 
+# Все tag_slug которые могут содержать CS2 матчи
+CS2_TAG_SLUGS = [
+    "counter-strike",
+    "cs2",
+    "esports",
+]
+
+CS2_IDENTIFIERS = [
+    "counter-strike", "cs2", "csgo", "cs:go"
+]
+
 EXCLUDE_WORDS = [
     "map 1", "map 2", "map 3", "map 4", "map 5",
     "first map", "pistol", "knife",
@@ -35,6 +46,8 @@ EXCLUDE_WORDS = [
     "first blood", "first kill", "ace", "bomb",
     "most kills", "handicap",
     "signs for", "signs with",
+    "will valve", "map pool", "which maps",
+    "what will", "how many",
 ]
 
 FALLBACK_RANKING = {
@@ -50,6 +63,11 @@ FALLBACK_RANKING = {
     "100 thieves": 30, "falcons": 31, "team falcons": 31,
     "furia": 32,
 }
+
+
+def is_cs2_event(event):
+    text = (event.get("title", "") + " " + event.get("slug", "")).lower()
+    return any(w in text for w in CS2_IDENTIFIERS)
 
 
 def is_resolved(market):
@@ -73,7 +91,7 @@ def is_match_market(market):
         return False
     if any(w in question for w in EXCLUDE_WORDS):
         return False
-    if market.get("closed") or market.get("archived"):
+    if market.get("closed"):
         return False
     if is_resolved(market):
         return False
@@ -171,7 +189,10 @@ def new_market_text(market):
 
 def list_text(markets):
     if not markets:
-        return "No active CS2 match markets found on Polymarket."
+        return (
+            "No active CS2 match markets on Polymarket right now.\n\n"
+            "IEM Rio just ended. Bot will notify when next matches appear 🔔"
+        )
     lines = ["<b>🎮 CS2 matches on Polymarket:</b>\n"]
     for m in markets[:15]:
         q = m.get("question", "?")[:60]
@@ -217,68 +238,55 @@ async def refresh_hltv(session):
         log.info("HLTV updated: %d teams", len(hltv_ranking))
 
 
-async def get_raw_events(session):
-    """Получить сырые события без фильтрации."""
-    try:
-        params = {
-            "tag_slug": "counter-strike",
-            "active": "true",
-            "closed": "false",
-            "limit": "20",
-            "offset": "0",
-            "order": "startDate",
-            "ascending": "false"
-        }
-        async with session.get(
-            GAMMA_API + "/events", params=params,
-            timeout=aiohttp.ClientTimeout(total=20),
-        ) as r:
-            if r.status != 200:
-                return [], r.status
-            data = await r.json()
-            events = data if isinstance(data, list) else data.get("events", data.get("data", []))
-            return events, r.status
-    except Exception as e:
-        return [], str(e)
-
-
 async def fetch_markets(session):
     all_markets = []
-    offset = 0
-    limit = 100
+    seen_event_ids = set()
 
-    while True:
-        try:
-            params = {
-                "tag_slug": "counter-strike",
-                "active": "true",
-                "closed": "false",
-                "limit": str(limit),
-                "offset": str(offset),
-                "order": "startDate",
-                "ascending": "false"
-            }
-            async with session.get(
-                GAMMA_API + "/events", params=params,
-                timeout=aiohttp.ClientTimeout(total=20),
-            ) as r:
-                if r.status != 200:
-                    break
-                data = await r.json()
-                events = data if isinstance(data, list) else data.get("events", data.get("data", []))
-                if not events:
-                    break
-                for event in events:
-                    for m in event.get("markets", []):
-                        all_markets.append(m)
-                log.info("offset=%d: %d events, %d markets total",
-                         offset, len(events), len(all_markets))
-                if len(events) < limit:
-                    break
-                offset += limit
-        except Exception as e:
-            log.warning("fetch_markets failed: %s", e)
-            break
+    for tag_slug in CS2_TAG_SLUGS:
+        offset = 0
+        limit = 100
+        while True:
+            try:
+                # Убираем active=true — ловим и upcoming рынки
+                params = {
+                    "tag_slug": tag_slug,
+                    "closed": "false",
+                    "limit": str(limit),
+                    "offset": str(offset),
+                    "order": "startDate",
+                    "ascending": "false"
+                }
+                async with session.get(
+                    GAMMA_API + "/events", params=params,
+                    timeout=aiohttp.ClientTimeout(total=20),
+                ) as r:
+                    if r.status != 200:
+                        break
+                    data = await r.json()
+                    events = data if isinstance(data, list) else data.get("events", data.get("data", []))
+                    if not events:
+                        break
+
+                    for event in events:
+                        eid = event.get("id")
+                        if eid in seen_event_ids:
+                            continue
+
+                        # Для тега esports — фильтруем только CS2 события
+                        if tag_slug == "esports" and not is_cs2_event(event):
+                            continue
+
+                        seen_event_ids.add(eid)
+                        for m in event.get("markets", []):
+                            all_markets.append(m)
+
+                    log.info("tag=%s offset=%d: %d events", tag_slug, offset, len(events))
+                    if len(events) < limit:
+                        break
+                    offset += limit
+            except Exception as e:
+                log.warning("fetch tag=%s offset=%d failed: %s", tag_slug, offset, e)
+                break
 
     seen = set()
     unique = []
@@ -289,7 +297,7 @@ async def fetch_markets(session):
             if is_match_market(m):
                 unique.append(m)
 
-    log.info("After filter: %d match markets from %d total", len(unique), len(all_markets))
+    log.info("Total: %d raw markets → %d match markets", len(all_markets), len(unique))
     return unique
 
 
@@ -309,7 +317,7 @@ async def tracker():
                             new_ones.append(m)
                         known_market_ids.add(mid)
                 if is_first_run:
-                    log.info("First run: %d markets loaded", len(markets))
+                    log.info("First run: %d markets", len(markets))
                     is_first_run = False
                 else:
                     log.info("Check: known=%d new=%d", len(known_market_ids), len(new_ones))
@@ -341,11 +349,11 @@ async def cmd_start(message: types.Message):
     await message.answer(
         "<b>🎮 CS2 Polymarket Tracker</b>\n\n"
         "Tracking new CS2 match markets on Polymarket.\n"
+        "You will be notified when a new match appears.\n"
         "Check interval: " + str(CHECK_INTERVAL // 60) + " min\n\n"
         "/list - current CS2 matches\n"
         "/ranking - HLTV top 20\n"
         "/status - bot status\n"
-        "/raw - raw API data (debug)\n"
         "/stop - unsubscribe",
         parse_mode="HTML",
         reply_markup=kb,
@@ -365,41 +373,6 @@ async def cmd_list(message: types.Message):
         await refresh_hltv(session)
         markets = await fetch_markets(session)
     await msg.edit_text(list_text(markets), parse_mode="HTML", disable_web_page_preview=True)
-
-
-@dp.message(Command("raw"))
-async def cmd_raw(message: types.Message):
-    """Показать сырые данные API без фильтрации."""
-    msg = await message.answer("Fetching raw data...")
-    async with aiohttp.ClientSession() as session:
-        events, status = await get_raw_events(session)
-
-    lines = ["<b>Raw API (tag_slug=counter-strike)</b>\n",
-             "Status: " + str(status),
-             "Events returned: " + str(len(events)) + "\n"]
-
-    for i, event in enumerate(events[:5]):
-        lines.append("Event " + str(i+1) + ": " + event.get("title", "?")[:50])
-        markets = event.get("markets", [])
-        lines.append("  Markets: " + str(len(markets)))
-        for m in markets[:3]:
-            q = m.get("question", "?")[:50]
-            closed = m.get("closed", "?")
-            active = m.get("active", "?")
-            prices = m.get("outcomePrices", "[]")
-            try:
-                if isinstance(prices, str):
-                    prices = json.loads(prices)
-                prices_str = str([round(float(p), 2) for p in prices[:2]])
-            except Exception:
-                prices_str = str(prices)[:30]
-            lines.append("  • " + q)
-            lines.append("    closed=" + str(closed) + " active=" + str(active) + " prices=" + prices_str)
-
-    text = "\n".join(lines)
-    if len(text) > 4000:
-        text = text[:4000] + "..."
-    await msg.edit_text(text, parse_mode="HTML")
 
 
 @dp.message(Command("ranking"))

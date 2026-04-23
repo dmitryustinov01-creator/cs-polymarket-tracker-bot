@@ -53,17 +53,99 @@ EXCLUDE_WORDS = [
 ]
 
 FALLBACK_RANKING = {
-    "vitality": 1, "natus vincere": 2, "navi": 2,
-    "faze": 3, "faze clan": 3, "g2": 4, "g2 esports": 4,
-    "spirit": 5, "team spirit": 5, "liquid": 6, "team liquid": 6,
-    "mouz": 7, "heroic": 8, "astralis": 9, "nip": 10,
-    "complexity": 11, "ence": 12, "cloud9": 13, "big": 14,
-    "eternal fire": 15, "fnatic": 16, "pain": 17, "3dmax": 18,
-    "mibr": 19, "virtus.pro": 21, "flyquest": 22, "monte": 23,
-    "saw": 24, "apeks": 25, "b8": 26, "betboom": 27,
-    "betboom team": 27, "parivision": 28, "aurora": 29,
-    "100 thieves": 30, "falcons": 31, "team falcons": 31,
+    "vitality": 1, "team vitality": 1,
+    "natus vincere": 2, "navi": 2,
+    "faze": 3, "faze clan": 3,
+    "g2": 4, "g2 esports": 4,
+    "spirit": 5, "team spirit": 5,
+    "liquid": 6, "team liquid": 6,
+    "mouz": 7, "mousesports": 7,
+    "heroic": 8,
+    "astralis": 9,
+    "nip": 10, "ninjas in pyjamas": 10,
+    "complexity": 11, "col": 11,
+    "ence": 12,
+    "cloud9": 13, "c9": 13,
+    "big": 14,
+    "eternal fire": 15,
+    "fnatic": 16,
+    "pain": 17, "pain gaming": 17,
+    "3dmax": 18,
+    "mibr": 19,
+    "imperial": 20, "imperial esports": 20,
+    "virtus.pro": 21, "vp": 21,
+    "flyquest": 22,
+    "monte": 23,
+    "saw": 24,
+    "apeks": 25,
+    "b8": 26,
+    "betboom": 27, "betboom team": 27,
+    "parivision": 28,
+    "aurora": 29,
+    "100 thieves": 30,
+    "falcons": 31, "team falcons": 31,
     "furia": 32,
+    "rare atom": 33,
+    "sangal": 34, "sangal esports": 34,
+    "sinners": 35, "sinners esports": 35,
+    "oddik": 36,
+    "ecstatic": 37,
+    "nemiga": 38,
+    "pera": 39, "pera esports": 39,
+    "9z": 40, "9z team": 40,
+    "sprout": 41,
+    "rebels": 42, "rebels gaming": 42,
+    "sashi": 43, "sashi esports": 43,
+    "unity": 44, "unity esports": 44, "unify esports": 44,
+    "into the breach": 45,
+    "endpoint": 46,
+    "entropiq": 47,
+    "young ninjas": 48,
+    "k23": 49,
+    "eyeballers": 50,
+    "passion ua": 51,
+    "gamerlegion": 52,
+    "movistar riders": 53,
+    "og": 54,
+    "forze": 55,
+    "copenhagen flames": 56,
+    "tricked": 57,
+    "tyloo": 58,
+    "atox": 59,
+    "true rippers": 60,
+    "imperial academy": 61,
+    "big academy": 62,
+    "g2 ares": 63,
+    "aurora young blood": 64,
+    "b8 academy": 65,
+    "navi junior": 66,
+    "lph gaming": 67,
+    "infurity gaming": 68,
+    "drama esports": 69,
+    "kolesie": 70,
+    "ctrl alt defeat": 71,
+    "oldboys": 72,
+    "clair obscur": 73,
+    "misa esports": 74,
+    "aimclub": 75,
+    "yngods": 76,
+    "hashiras": 77,
+    "rustec": 78,
+    "eternal premium": 79,
+    "glitchtech esports": 80, "glitchtech": 80,
+    "havens": 81,
+    "rethink": 82,
+    "enjoy": 83,
+    "jumbo team": 84,
+    "nerve of cow": 85,
+    "playersclub": 86,
+    "masonic": 87,
+    "megoshort": 88,
+    "csdiilit": 89,
+    "donstu esports": 90, "donstu": 90,
+    "depo": 91,
+    "sangal alters": 92,
+    "fokus reality": 93,
 }
 
 
@@ -567,15 +649,55 @@ async def show_mystats(message: types.Message):
     pnl_str = ("+" if stats["total_pnl"] >= 0 else "") + str(stats["total_pnl"])
     text = (
         "<b>📈 Your prediction stats</b>\n\n"
-        "Total: " + str(stats["total"]) + " predictions\n"
-        "Finished: " + str(stats["finished"]) + "\n"
-        "Pending: " + str(stats["pending"]) + "\n\n"
-        "✅ Wins: " + str(stats["wins"]) + "\n"
-        "❌ Losses: " + str(stats["losses"]) + "\n"
-        "Win rate: <b>" + str(stats["win_rate"]) + "%</b>\n\n"
+        "Total: " + str(stats["total"]) + " | "
+        "✅ " + str(stats["wins"]) + " | "
+        "❌ " + str(stats["losses"]) + " | "
+        "⏳ " + str(stats["pending"]) + "\n"
+        "Win rate: <b>" + str(stats["win_rate"]) + "%</b>\n"
         "Paper P&L ($10/bet): <b>" + pnl_str + "$</b>"
     )
     await message.answer(text, parse_mode="HTML", reply_markup=MAIN_MENU)
+
+    # История ставок — последние 20
+    user_preds = predictions.get(chat_id, {})
+    if not user_preds:
+        return
+
+    sorted_preds = sorted(
+        user_preds.items(),
+        key=lambda x: x[1].get("ts", ""),
+        reverse=True
+    )[:20]
+
+    lines = ["<b>📋 Bet history (last 20):</b>\n"]
+    for mid, p in sorted_preds:
+        outcome = p.get("outcome")
+        if outcome == "win":
+            icon = "✅"
+            pnl = round(PAPER_BET_SIZE * (1.0 / p["entry_price"] - 1), 2)
+            pnl_s = "+" + str(pnl) + "$"
+        elif outcome == "loss":
+            icon = "❌"
+            pnl_s = "-" + str(PAPER_BET_SIZE) + "$"
+        else:
+            icon = "⏳"
+            pnl_s = "pending"
+
+        q = p.get("question", "?")
+        q = q.replace("Counter-Strike: ", "").replace("Counter-Strike:", "")
+        if " (" in q:
+            q = q[:q.index(" (")]
+        q = q[:40]
+
+        chosen = p.get("chosen_team", "?")[:15]
+        price = str(round(p.get("entry_price", 0.5) * 100)) + "c"
+
+        lines.append(icon + " " + q + "\n   → " + chosen + " @ " + price + " | " + pnl_s)
+
+    history_text = "\n".join(lines)
+    if len(history_text) > 4000:
+        history_text = history_text[:4000] + "..."
+    await message.answer(history_text, parse_mode="HTML")
 
 
 @dp.message(Command("mystats"))

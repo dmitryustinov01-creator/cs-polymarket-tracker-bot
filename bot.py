@@ -27,14 +27,34 @@ known_market_ids = set()
 is_first_run = True
 hltv_ranking = {}
 hltv_last_updated = None
-
-# paper trading хранилище
-# predictions[chat_id][market_id] = {
-#   "question": str, "chosen_team": str, "chosen_idx": int,
-#   "entry_price": float, "market_url": str, "ts": str,
-#   "outcome": None | "win" | "loss"
-# }
 predictions = {}
+
+DATA_FILE = "data.json"
+
+
+def load_data():
+    global predictions, subscribers
+    try:
+        if os.path.exists(DATA_FILE):
+            with open(DATA_FILE, "r") as f:
+                data = json.load(f)
+            predictions = {int(k): v for k, v in data.get("predictions", {}).items()}
+            subscribers = set(int(x) for x in data.get("subscribers", []))
+            log.info("Loaded: %d subscribers, %d prediction sets", len(subscribers), len(predictions))
+    except Exception as e:
+        log.error("load_data failed: %s", e)
+
+
+def save_data():
+    try:
+        data = {
+            "predictions": {str(k): v for k, v in predictions.items()},
+            "subscribers": list(subscribers),
+        }
+        with open(DATA_FILE, "w") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception as e:
+        log.error("save_data failed: %s", e)
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 
@@ -447,6 +467,7 @@ async def check_predictions(session):
             chosen_idx = pred["chosen_idx"]
             is_win = (chosen_idx == winner_idx)
             pred["outcome"] = "win" if is_win else "loss"
+            save_data()
 
             # Считаем P&L
             entry_price = pred["entry_price"]
@@ -598,6 +619,7 @@ async def send_matches(target, markets):
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     subscribers.add(message.chat.id)
+    save_data()
     await message.answer(
         "<b>🎮 CS2 Polymarket Tracker</b>\n\n"
         "Tracking CS2 matches on Polymarket.\n"
@@ -611,6 +633,7 @@ async def cmd_start(message: types.Message):
 @dp.message(Command("stop"))
 async def cmd_stop(message: types.Message):
     subscribers.discard(message.chat.id)
+    save_data()
     await message.answer("Unsubscribed. Send /start to subscribe again.")
 
 
@@ -832,6 +855,7 @@ async def cb_pick(callback: types.CallbackQuery):
         "ts": datetime.now(timezone.utc).isoformat(),
         "outcome": None,
     }
+    save_data()
 
     pot_win = round(PAPER_BET_SIZE * (1.0 / entry_price - 1), 2) if entry_price > 0 else 0
 
@@ -849,6 +873,7 @@ async def cb_pick(callback: types.CallbackQuery):
 async def main():
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN is not set!")
+    load_data()
     log.info("Starting bot...")
     asyncio.create_task(tracker())
     await dp.start_polling(bot)

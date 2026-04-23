@@ -473,74 +473,101 @@ async def tracker():
 
 # ─── Handlers ─────────────────────────────────────────────────────────────────
 
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+
+MAIN_MENU = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="🎮 Matches"), KeyboardButton(text="📈 My Stats")],
+        [KeyboardButton(text="📊 HLTV Top-20"), KeyboardButton(text="ℹ️ Status")],
+    ],
+    resize_keyboard=True,
+    persistent=True,
+)
+
+
+async def send_matches(target, markets):
+    """Отправляет матчи с кнопками прогноза. target — message или chat."""
+    if not markets:
+        await target.answer(
+            "No active CS2 matches right now. Bot will notify when new matches appear 🔔",
+            reply_markup=MAIN_MENU,
+        )
+        return
+
+    await target.answer(
+        "<b>🎮 CS2 matches — " + str(len(markets)) + " active</b>\n"
+        "Tap a team name to make a paper prediction 👇",
+        parse_mode="HTML",
+        reply_markup=MAIN_MENU,
+    )
+    for m in markets[:15]:
+        question = m.get("question", "?")
+        line = matchup_line(m)
+        text = "<b>" + question[:80] + "</b>\n" + line
+        kb = prediction_keyboard(m)
+        await target.answer(text, parse_mode="HTML", reply_markup=kb,
+                            disable_web_page_preview=True)
+        await asyncio.sleep(0.2)
+
+    if len(markets) > 15:
+        await target.answer("...and " + str(len(markets) - 15) + " more matches.")
+
+
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     subscribers.add(message.chat.id)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎮 CS2 matches", callback_data="list")],
-        [InlineKeyboardButton(text="📊 HLTV Top-20", callback_data="ranking")],
-        [InlineKeyboardButton(text="📈 My stats", callback_data="mystats")],
-    ])
     await message.answer(
         "<b>🎮 CS2 Polymarket Tracker</b>\n\n"
         "Tracking CS2 matches on Polymarket.\n"
-        "Make paper predictions to track your edge!\n\n"
-        "/list - current CS2 matches\n"
-        "/mystats - your prediction stats\n"
-        "/ranking - HLTV top 20\n"
-        "/status - bot status\n"
-        "/stop - unsubscribe",
+        "Tap team buttons to make paper predictions!\n\n"
+        "Use the menu below 👇",
         parse_mode="HTML",
-        reply_markup=kb,
+        reply_markup=MAIN_MENU,
     )
 
 
 @dp.message(Command("stop"))
 async def cmd_stop(message: types.Message):
     subscribers.discard(message.chat.id)
-    await message.answer("Unsubscribed. /start to subscribe again.")
+    await message.answer("Unsubscribed. Send /start to subscribe again.")
+
+
+async def show_matches(message: types.Message):
+    msg = await message.answer("Loading CS2 matches...", reply_markup=MAIN_MENU)
+    async with aiohttp.ClientSession() as session:
+        await refresh_hltv(session)
+        markets = await fetch_markets(session)
+    await msg.delete()
+    await send_matches(message, markets)
 
 
 @dp.message(Command("list"))
 async def cmd_list(message: types.Message):
-    msg = await message.answer("Loading CS2 matches...")
-    async with aiohttp.ClientSession() as session:
-        await refresh_hltv(session)
-        markets = await fetch_markets(session)
-
-    if not markets:
-        await msg.edit_text("No active CS2 matches right now. Bot will notify when new matches appear 🔔")
-        return
-
-    lines = ["<b>🎮 CS2 matches on Polymarket:</b>\n"]
-    for m in markets[:15]:
-        q = m.get("question", "?")[:60]
-        url = market_url(m)
-        line = matchup_line(m)
-        lines.append("- <a href=\"" + url + "\">" + q + "</a>\n  " + line)
-    if len(markets) > 15:
-        lines.append("\n...and " + str(len(markets) - 15) + " more")
-
-    await msg.edit_text("\n\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
+    await show_matches(message)
 
 
-@dp.message(Command("mystats"))
-async def cmd_mystats(message: types.Message):
+@dp.message(lambda m: m.text == "🎮 Matches")
+async def btn_matches(message: types.Message):
+    await show_matches(message)
+
+
+async def show_mystats(message: types.Message):
     chat_id = message.chat.id
     stats = get_user_stats(chat_id)
 
     if stats["total"] == 0:
         await message.answer(
             "📊 No predictions yet!\n\n"
-            "Make predictions by tapping team buttons on match notifications or /list.",
-            parse_mode="HTML"
+            "Tap team buttons on match notifications to make predictions.",
+            parse_mode="HTML",
+            reply_markup=MAIN_MENU,
         )
         return
 
     pnl_str = ("+" if stats["total_pnl"] >= 0 else "") + str(stats["total_pnl"])
     text = (
-        "<b>📊 Your prediction stats</b>\n\n"
-        "Total predictions: " + str(stats["total"]) + "\n"
+        "<b>📈 Your prediction stats</b>\n\n"
+        "Total: " + str(stats["total"]) + " predictions\n"
         "Finished: " + str(stats["finished"]) + "\n"
         "Pending: " + str(stats["pending"]) + "\n\n"
         "✅ Wins: " + str(stats["wins"]) + "\n"
@@ -548,37 +575,66 @@ async def cmd_mystats(message: types.Message):
         "Win rate: <b>" + str(stats["win_rate"]) + "%</b>\n\n"
         "Paper P&L ($10/bet): <b>" + pnl_str + "$</b>"
     )
-    await message.answer(text, parse_mode="HTML")
+    await message.answer(text, parse_mode="HTML", reply_markup=MAIN_MENU)
 
 
-@dp.message(Command("ranking"))
-async def cmd_ranking(message: types.Message):
+@dp.message(Command("mystats"))
+async def cmd_mystats(message: types.Message):
+    await show_mystats(message)
+
+
+@dp.message(lambda m: m.text == "📈 My Stats")
+async def btn_mystats(message: types.Message):
+    await show_mystats(message)
+
+
+async def show_ranking(message: types.Message):
     ranking = hltv_ranking if hltv_ranking else FALLBACK_RANKING
     top = sorted(ranking.items(), key=lambda x: x[1])[:20]
-    lines = ["<b>HLTV Top-20:</b>\n"]
+    lines = ["<b>📊 HLTV Top-20:</b>\n"]
     seen_ranks = set()
     for name, rank in top:
         if rank not in seen_ranks:
             seen_ranks.add(rank)
             lines.append("#" + str(rank) + " " + name.title())
     lines.append("\nSource: " + ("live HLTV" if hltv_ranking else "fallback"))
-    await message.answer("\n".join(lines), parse_mode="HTML")
+    await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=MAIN_MENU)
 
 
-@dp.message(Command("status"))
-async def cmd_status(message: types.Message):
+@dp.message(Command("ranking"))
+async def cmd_ranking(message: types.Message):
+    await show_ranking(message)
+
+
+@dp.message(lambda m: m.text == "📊 HLTV Top-20")
+async def btn_ranking(message: types.Message):
+    await show_ranking(message)
+
+
+async def show_status(message: types.Message):
     subbed = "yes" if message.chat.id in subscribers else "no"
     user_preds = predictions.get(message.chat.id, {})
     pending = sum(1 for p in user_preds.values() if not p.get("outcome"))
     await message.answer(
-        "<b>Status</b>\n"
+        "<b>ℹ️ Status</b>\n"
         "Subscribed: " + subbed + "\n"
         "Known markets: " + str(len(known_market_ids)) + "\n"
         "HLTV teams: " + str(len(hltv_ranking)) + "\n"
         "Your predictions: " + str(len(user_preds)) + " total, " + str(pending) + " pending\n"
-        "Interval: " + str(CHECK_INTERVAL) + "s",
+        "Check interval: " + str(CHECK_INTERVAL) + "s",
         parse_mode="HTML",
+        reply_markup=MAIN_MENU,
     )
+
+
+@dp.message(Command("status"))
+async def cmd_status(message: types.Message):
+    await show_status(message)
+
+
+@dp.message(lambda m: m.text == "ℹ️ Status")
+async def btn_status(message: types.Message):
+    await show_status(message)
 
 
 # ─── Callbacks ────────────────────────────────────────────────────────────────
@@ -589,30 +645,19 @@ async def cb_list(callback: types.CallbackQuery):
     async with aiohttp.ClientSession() as session:
         await refresh_hltv(session)
         markets = await fetch_markets(session)
-    if not markets:
-        await callback.message.answer("No active CS2 matches right now 🔔")
-        return
-    lines = ["<b>🎮 CS2 matches on Polymarket:</b>\n"]
-    for m in markets[:15]:
-        q = m.get("question", "?")[:60]
-        url = market_url(m)
-        line = matchup_line(m)
-        lines.append("- <a href=\"" + url + "\">" + q + "</a>\n  " + line)
-    if len(markets) > 15:
-        lines.append("\n...and " + str(len(markets) - 15) + " more")
-    await callback.message.answer("\n\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
+    await send_matches(callback.message, markets)
 
 
 @dp.callback_query(lambda c: c.data == "ranking")
 async def cb_ranking(callback: types.CallbackQuery):
     await callback.answer()
-    await cmd_ranking(callback.message)
+    await show_ranking(callback.message)
 
 
 @dp.callback_query(lambda c: c.data == "mystats")
 async def cb_mystats(callback: types.CallbackQuery):
     await callback.answer()
-    await cmd_mystats(callback.message)
+    await show_mystats(callback.message)
 
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("pick:"))

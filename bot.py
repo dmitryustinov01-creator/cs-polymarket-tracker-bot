@@ -12,9 +12,9 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "120"))
-RESULT_CHECK_INTERVAL = 600   # проверка результатов каждые 10 минут
-PRICE_CHECK_INTERVAL = 300    # проверка цен каждые 5 минут
-PRICE_ALERT_THRESHOLD = 0.07  # уведомление при изменении цены на 7%+
+RESULT_CHECK_INTERVAL = 600
+PRICE_CHECK_INTERVAL = 300
+PRICE_ALERT_THRESHOLD = 0.07
 HLTV_UPDATE_INTERVAL = 3600
 PAPER_BET_SIZE = 10.0
 
@@ -30,10 +30,6 @@ is_first_run = True
 hltv_ranking = {}
 hltv_last_updated = None
 
-# predictions[chat_id][market_id] = {
-#   "question", "chosen_team", "chosen_idx",
-#   "entry_price", "last_price", "market_url", "ts", "outcome"
-# }
 predictions = {}
 
 GAMMA_API = "https://gamma-api.polymarket.com"
@@ -198,17 +194,24 @@ def prediction_keyboard(market):
     ]])
 
 
+def now_str():
+    """Текущее время UTC в читаемом формате."""
+    return datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
+
+
 def new_market_text(market):
     question = market.get("question", "?")
     volume = format_volume(market)
     end_raw = market.get("endDate", "")
     try:
-        end_date = datetime.fromisoformat(end_raw.replace("Z", "+00:00")).strftime("%d.%m.%Y")
+        end_date = datetime.fromisoformat(end_raw.replace("Z", "+00:00")).strftime("%d.%m.%Y %H:%M UTC")
     except Exception:
         end_date = "?"
     line = matchup_line(market)
+    # ← ИЗМЕНЕНИЕ: добавили время публикации
     return (
-        "<b>🎮 New CS2 match on Polymarket!</b>\n\n"
+        "<b>🎮 New CS2 match on Polymarket!</b>\n"
+        + "🕐 " + now_str() + "\n\n"
         + question + "\n\n"
         + line + "\n\n"
         + "Volume: " + volume + " | Closes: " + end_date + "\n\n"
@@ -340,11 +343,10 @@ async def fetch_market_by_id(session, market_id):
 # ─── Price tracking ───────────────────────────────────────────────────────────
 
 async def check_price_changes(session):
-    """Проверяем изменения цен только для рынков с активными прогнозами."""
     for chat_id, user_preds in predictions.items():
         for market_id, pred in user_preds.items():
             if pred.get("outcome"):
-                continue  # матч завершён — не отслеживаем
+                continue
 
             market = await fetch_market_by_id(session, market_id)
             if not market:
@@ -362,7 +364,6 @@ async def check_price_changes(session):
             change = current_price - last_price
             change_from_entry = current_price - entry_price
 
-            # Уведомляем только при изменении >= PRICE_ALERT_THRESHOLD от последней цены
             if abs(change) >= PRICE_ALERT_THRESHOLD:
                 direction = "📈" if change > 0 else "📉"
                 direction_word = "UP" if change > 0 else "DOWN"
@@ -381,9 +382,8 @@ async def check_price_changes(session):
                     await bot.send_message(chat_id, text, parse_mode="HTML",
                                            disable_web_page_preview=True)
                 except Exception as e:
-                    log.warning("price alert send error %s: %s", chat_id, e)
+                    log.warning("price alert error %s: %s", chat_id, e)
 
-                # Обновляем last_price
                 pred["last_price"] = current_price
 
 
@@ -407,7 +407,6 @@ def get_winner_idx(market):
 
 
 async def check_predictions(session):
-    """Проверяем результаты завершённых матчей."""
     for chat_id, user_preds in predictions.items():
         for market_id, pred in list(user_preds.items()):
             if pred.get("outcome"):
@@ -474,6 +473,7 @@ def get_user_stats(chat_id):
         "wins": wins, "losses": losses,
         "pending": pending, "win_rate": win_rate,
         "total_pnl": round(total_pnl, 2),
+        "preds": user_preds,
     }
 
 
@@ -573,19 +573,62 @@ async def cmd_list(message: types.Message):
 async def cmd_mystats(message: types.Message):
     chat_id = message.chat.id
     stats = get_user_stats(chat_id)
+
     if stats["total"] == 0:
         await message.answer("📊 No predictions yet!\n\nMake predictions by tapping team buttons on new match notifications.")
         return
+
     pnl_str = ("+" if stats["total_pnl"] >= 0 else "") + str(stats["total_pnl"])
+
+    # Общая сводка
     text = (
         "<b>📊 Your prediction stats</b>\n\n"
         "Total: " + str(stats["total"]) + " | Pending: " + str(stats["pending"]) + "\n\n"
         "✅ Wins: " + str(stats["wins"]) + "\n"
         "❌ Losses: " + str(stats["losses"]) + "\n"
         "Win rate: <b>" + str(stats["win_rate"]) + "%</b>\n\n"
-        "Paper P&L ($10/bet): <b>" + pnl_str + "$</b>"
+        "Paper P&L ($10/bet): <b>" + pnl_str + "$</b>\n\n"
+        "─────────────────\n"
+        "<b>Your picks:</b>\n\n"
     )
-    await message.answer(text, parse_mode="HTML")
+
+    # ← ИЗМЕНЕНИЕ: список каждого прогноза со временем, ссылкой и изменением цены
+    for pred in stats["preds"].values():
+        entry = pred["entry_price"]
+        last = pred.get("last_price", entry)
+        delta = last - entry
+        delta_str = ("+" if delta >= 0 else "") + str(round(delta * 100)) + "c"
+
+        # иконка исхода
+        if pred.get("outcome") == "win":
+            icon = "✅"
+        elif pred.get("outcome") == "loss":
+            icon = "❌"
+        else:
+            icon = "⏳"
+
+        # время прогноза
+        try:
+            ts = datetime.fromisoformat(pred["ts"]).strftime("%d.%m %H:%M")
+        except Exception:
+            ts = "?"
+
+        # изменение цены — только для pending
+        price_info = ""
+        if not pred.get("outcome"):
+            price_info = " | now " + str(round(last * 100)) + "c (" + delta_str + ")"
+
+        text += (
+            icon + " <a href=\"" + pred["market_url"] + "\">" + pred["question"][:45] + "</a>\n"
+            + "   Pick: <b>" + pred["chosen_team"] + "</b> @ " + str(round(entry * 100)) + "c"
+            + price_info + "\n"
+            + "   🕐 " + ts + "\n\n"
+        )
+
+    if len(text) > 4000:
+        text = text[:4000] + "..."
+
+    await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
 
 
 @dp.message(Command("ranking"))
@@ -653,7 +696,6 @@ async def cb_pick(callback: types.CallbackQuery):
     chosen_idx = int(parts[2])
     chat_id = callback.message.chat.id
 
-    # Уже сделан прогноз?
     if chat_id in predictions and market_id in predictions[chat_id]:
         existing = predictions[chat_id][market_id]
         await callback.answer(
@@ -685,7 +727,7 @@ async def cb_pick(callback: types.CallbackQuery):
         "chosen_team": chosen_team,
         "chosen_idx": chosen_idx,
         "entry_price": entry_price,
-        "last_price": entry_price,  # для трекинга изменений
+        "last_price": entry_price,
         "market_url": market_url(market),
         "ts": datetime.now(timezone.utc).isoformat(),
         "outcome": None,

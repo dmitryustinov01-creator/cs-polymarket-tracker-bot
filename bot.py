@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 import aiohttp
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "120"))
@@ -616,15 +616,18 @@ async def tracker():
 async def cmd_start(message: types.Message):
     subscribers.add(message.chat.id)
     save_subscribers()
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎮 CS2 matches", callback_data="list")],
-        [InlineKeyboardButton(text="📊 HLTV Top-20", callback_data="ranking")],
-        [InlineKeyboardButton(text="📈 My stats", callback_data="mystats")],
-    ])
+    kb = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🎮 Matches"), KeyboardButton(text="📈 My Stats")],
+            [KeyboardButton(text="📊 HLTV Top-20"), KeyboardButton(text="ℹ️ Status")],
+        ],
+        resize_keyboard=True,
+        persistent=True,
+    )
     await message.answer(
         "<b>🎮 CS2 Polymarket Tracker</b>\n\n"
         "Tracks new CS2 matches and notifies you.\n"
-        "Tap a team on new match notifications to make paper predictions.\n\n"
+        "Tap a team on match notifications to make paper predictions.\n\n"
         "/list - current CS2 matches\n"
         "/mystats - prediction stats\n"
         "/ranking - HLTV top 20\n"
@@ -633,6 +636,28 @@ async def cmd_start(message: types.Message):
         parse_mode="HTML",
         reply_markup=kb,
     )
+
+
+# ─── Reply keyboard text handlers ─────────────────────────────────────────────
+
+@dp.message(lambda m: m.text == "🎮 Matches")
+async def btn_matches(message: types.Message):
+    await cmd_list(message)
+
+
+@dp.message(lambda m: m.text == "📈 My Stats")
+async def btn_mystats(message: types.Message):
+    await cmd_mystats(message)
+
+
+@dp.message(lambda m: m.text == "📊 HLTV Top-20")
+async def btn_ranking(message: types.Message):
+    await cmd_ranking(message)
+
+
+@dp.message(lambda m: m.text == "ℹ️ Status")
+async def btn_status(message: types.Message):
+    await cmd_status(message)
 
 
 @dp.message(Command("stop"))

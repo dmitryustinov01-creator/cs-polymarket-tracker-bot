@@ -18,6 +18,12 @@ PRICE_ALERT_THRESHOLD = 0.07
 HLTV_UPDATE_INTERVAL = 3600
 PAPER_BET_SIZE = 10.0
 
+# Файлы для хранения данных между рестартами
+DATA_DIR = os.getenv("DATA_DIR", "/data")
+PREDICTIONS_FILE = os.path.join(DATA_DIR, "predictions.json")
+SUBSCRIBERS_FILE = os.path.join(DATA_DIR, "subscribers.json")
+KNOWN_MARKETS_FILE = os.path.join(DATA_DIR, "known_markets.json")
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
@@ -29,7 +35,6 @@ known_market_ids = set()
 is_first_run = True
 hltv_ranking = {}
 hltv_last_updated = None
-
 predictions = {}
 
 GAMMA_API = "https://gamma-api.polymarket.com"
@@ -61,6 +66,79 @@ FALLBACK_RANKING = {
     "100 thieves": 30, "falcons": 31, "team falcons": 31,
     "furia": 32,
 }
+
+
+# ─── Persistence ──────────────────────────────────────────────────────────────
+
+def ensure_data_dir():
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+
+def save_predictions():
+    try:
+        ensure_data_dir()
+        # Конвертируем int ключи в строки для JSON
+        data = {str(k): v for k, v in predictions.items()}
+        with open(PREDICTIONS_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        log.warning("save_predictions failed: %s", e)
+
+
+def load_predictions():
+    global predictions
+    try:
+        if os.path.exists(PREDICTIONS_FILE):
+            with open(PREDICTIONS_FILE) as f:
+                data = json.load(f)
+            predictions = {int(k): v for k, v in data.items()}
+            total = sum(len(v) for v in predictions.values())
+            log.info("Loaded predictions: %d users, %d total", len(predictions), total)
+    except Exception as e:
+        log.warning("load_predictions failed: %s", e)
+        predictions = {}
+
+
+def save_subscribers():
+    try:
+        ensure_data_dir()
+        with open(SUBSCRIBERS_FILE, "w") as f:
+            json.dump(list(subscribers), f)
+    except Exception as e:
+        log.warning("save_subscribers failed: %s", e)
+
+
+def load_subscribers():
+    global subscribers
+    try:
+        if os.path.exists(SUBSCRIBERS_FILE):
+            with open(SUBSCRIBERS_FILE) as f:
+                subscribers = set(json.load(f))
+            log.info("Loaded subscribers: %d", len(subscribers))
+    except Exception as e:
+        log.warning("load_subscribers failed: %s", e)
+        subscribers = set()
+
+
+def save_known_markets():
+    try:
+        ensure_data_dir()
+        with open(KNOWN_MARKETS_FILE, "w") as f:
+            json.dump(list(known_market_ids), f)
+    except Exception as e:
+        log.warning("save_known_markets failed: %s", e)
+
+
+def load_known_markets():
+    global known_market_ids
+    try:
+        if os.path.exists(KNOWN_MARKETS_FILE):
+            with open(KNOWN_MARKETS_FILE) as f:
+                known_market_ids = set(json.load(f))
+            log.info("Loaded known markets: %d", len(known_market_ids))
+    except Exception as e:
+        log.warning("load_known_markets failed: %s", e)
+        known_market_ids = set()
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -195,7 +273,6 @@ def prediction_keyboard(market):
 
 
 def now_str():
-    """Текущее время UTC в читаемом формате."""
     return datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
 
 
@@ -208,7 +285,6 @@ def new_market_text(market):
     except Exception:
         end_date = "?"
     line = matchup_line(market)
-    # ← ИЗМЕНЕНИЕ: добавили время публикации
     return (
         "<b>🎮 New CS2 match on Polymarket!</b>\n"
         + "🕐 " + now_str() + "\n\n"
@@ -360,14 +436,12 @@ async def check_price_changes(session):
             current_price = prices[chosen_idx]
             last_price = pred.get("last_price", pred["entry_price"])
             entry_price = pred["entry_price"]
-
             change = current_price - last_price
             change_from_entry = current_price - entry_price
 
             if abs(change) >= PRICE_ALERT_THRESHOLD:
                 direction = "📈" if change > 0 else "📉"
                 direction_word = "UP" if change > 0 else "DOWN"
-
                 text = (
                     direction + " <b>Price moved " + direction_word + "!</b>\n\n"
                     + pred["question"] + "\n\n"
@@ -385,6 +459,7 @@ async def check_price_changes(session):
                     log.warning("price alert error %s: %s", chat_id, e)
 
                 pred["last_price"] = current_price
+                save_predictions()
 
 
 # ─── Result checking ──────────────────────────────────────────────────────────
@@ -407,6 +482,7 @@ def get_winner_idx(market):
 
 
 async def check_predictions(session):
+    changed = False
     for chat_id, user_preds in predictions.items():
         for market_id, pred in list(user_preds.items()):
             if pred.get("outcome"):
@@ -423,12 +499,10 @@ async def check_predictions(session):
             chosen_idx = pred["chosen_idx"]
             is_win = (chosen_idx == winner_idx)
             pred["outcome"] = "win" if is_win else "loss"
+            changed = True
 
             entry_price = pred["entry_price"]
-            if is_win:
-                pnl = round(PAPER_BET_SIZE * (1.0 / entry_price - 1), 2)
-            else:
-                pnl = -PAPER_BET_SIZE
+            pnl = round(PAPER_BET_SIZE * (1.0 / entry_price - 1), 2) if is_win else -PAPER_BET_SIZE
 
             teams = extract_teams(market)
             winner_name = teams[winner_idx] if winner_idx < len(teams) else "Unknown"
@@ -442,12 +516,14 @@ async def check_predictions(session):
                 + "Paper P&L: <b>" + ("+" if pnl >= 0 else "") + str(pnl) + "$</b>\n\n"
                 + "<a href=\"" + pred["market_url"] + "\">View market</a>"
             )
-
             try:
                 await bot.send_message(chat_id, result_text, parse_mode="HTML",
                                        disable_web_page_preview=True)
             except Exception as e:
                 log.warning("send result error %s: %s", chat_id, e)
+
+    if changed:
+        save_predictions()
 
 
 # ─── Stats ────────────────────────────────────────────────────────────────────
@@ -496,11 +572,14 @@ async def tracker():
                         if not is_first_run:
                             new_ones.append(m)
                         known_market_ids.add(mid)
+
                 if is_first_run:
                     log.info("First run: %d markets", len(markets))
                     is_first_run = False
                 else:
                     log.info("Check: known=%d new=%d", len(known_market_ids), len(new_ones))
+                    if new_ones:
+                        save_known_markets()
 
                 for market in new_ones:
                     text = new_market_text(market)
@@ -514,6 +593,7 @@ async def tracker():
                             log.warning("send error %s: %s", chat_id, e)
                             if "blocked" in str(e).lower() or "not found" in str(e).lower():
                                 subscribers.discard(chat_id)
+                                save_subscribers()
 
                 result_counter += CHECK_INTERVAL
                 if result_counter >= RESULT_CHECK_INTERVAL:
@@ -535,6 +615,7 @@ async def tracker():
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     subscribers.add(message.chat.id)
+    save_subscribers()
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎮 CS2 matches", callback_data="list")],
         [InlineKeyboardButton(text="📊 HLTV Top-20", callback_data="ranking")],
@@ -557,6 +638,7 @@ async def cmd_start(message: types.Message):
 @dp.message(Command("stop"))
 async def cmd_stop(message: types.Message):
     subscribers.discard(message.chat.id)
+    save_subscribers()
     await message.answer("Unsubscribed. /start to subscribe again.")
 
 
@@ -579,8 +661,6 @@ async def cmd_mystats(message: types.Message):
         return
 
     pnl_str = ("+" if stats["total_pnl"] >= 0 else "") + str(stats["total_pnl"])
-
-    # Общая сводка
     text = (
         "<b>📊 Your prediction stats</b>\n\n"
         "Total: " + str(stats["total"]) + " | Pending: " + str(stats["pending"]) + "\n\n"
@@ -592,14 +672,12 @@ async def cmd_mystats(message: types.Message):
         "<b>Your picks:</b>\n\n"
     )
 
-    # ← ИЗМЕНЕНИЕ: список каждого прогноза со временем, ссылкой и изменением цены
     for pred in stats["preds"].values():
         entry = pred["entry_price"]
         last = pred.get("last_price", entry)
         delta = last - entry
         delta_str = ("+" if delta >= 0 else "") + str(round(delta * 100)) + "c"
 
-        # иконка исхода
         if pred.get("outcome") == "win":
             icon = "✅"
         elif pred.get("outcome") == "loss":
@@ -607,13 +685,11 @@ async def cmd_mystats(message: types.Message):
         else:
             icon = "⏳"
 
-        # время прогноза
         try:
             ts = datetime.fromisoformat(pred["ts"]).strftime("%d.%m %H:%M")
         except Exception:
             ts = "?"
 
-        # изменение цены — только для pending
         price_info = ""
         if not pred.get("outcome"):
             price_info = " | now " + str(round(last * 100)) + "c (" + delta_str + ")"
@@ -732,16 +808,16 @@ async def cb_pick(callback: types.CallbackQuery):
         "ts": datetime.now(timezone.utc).isoformat(),
         "outcome": None,
     }
+    save_predictions()
 
     pot_win = round(PAPER_BET_SIZE * (1.0 / entry_price - 1), 2) if entry_price > 0 else 0
-
     await callback.answer(
         "✅ Picked " + chosen_team + " @ " + str(round(entry_price * 100)) + "c\n"
         "Potential win: +$" + str(pot_win) + "\n"
         "Price alerts: ON (±7%)",
         show_alert=True
     )
-    log.info("Prediction: chat=%s market=%s team=%s price=%.2f",
+    log.info("Prediction saved: chat=%s market=%s team=%s price=%.2f",
              chat_id, market_id, chosen_team, entry_price)
 
 
@@ -750,7 +826,15 @@ async def cb_pick(callback: types.CallbackQuery):
 async def main():
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN is not set!")
-    log.info("Starting bot...")
+
+    # Загружаем данные при старте
+    load_subscribers()
+    load_predictions()
+    load_known_markets()
+
+    log.info("Starting bot... subscribers=%d predictions_users=%d known_markets=%d",
+             len(subscribers), len(predictions), len(known_market_ids))
+
     asyncio.create_task(tracker())
     await dp.start_polling(bot)
 

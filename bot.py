@@ -419,8 +419,8 @@ async def fetch_market_by_id(session, market_id):
 # ─── Price tracking ───────────────────────────────────────────────────────────
 
 async def check_price_changes(session):
-    for chat_id, user_preds in predictions.items():
-        for market_id, pred in user_preds.items():
+    for chat_id, user_preds in list(predictions.items()):
+        for market_id, pred in list(user_preds.items()):
             if pred.get("outcome"):
                 continue
 
@@ -707,7 +707,7 @@ async def cmd_mystats(message: types.Message):
         "✅ Wins: " + str(stats["wins"]) + "\n"
         "❌ Losses: " + str(stats["losses"]) + "\n"
         "Win rate: <b>" + str(stats["win_rate"]) + "%</b>\n\n"
-        "Paper P&L ($10/bet): <b>" + pnl_str + "$</b>\n\n"
+        "Paper P&amp;L ($10/bet): <b>" + pnl_str + "$</b>\n\n"
         "─────────────────\n"
         "<b>Your picks:</b>\n\n"
     )
@@ -735,20 +735,32 @@ async def cmd_mystats(message: types.Message):
             price_info = " | now " + str(round(last * 100)) + "c (" + delta_str + ")"
 
         end_dt = pred.get("end_dt", "")
-        match_time = ("   📅 Match: " + end_dt + " UTC\n") if end_dt else ""
+        match_time = ("   📅 " + end_dt + " UTC\n") if end_dt else ""
+
+        # Экранируем спецсимволы HTML в названиях команд и вопросах
+        question = pred["question"][:45].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        chosen = pred["chosen_team"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
         text += (
-            icon + " <a href=\"" + pred["market_url"] + "\">" + pred["question"][:45] + "</a>\n"
-            + "   Pick: <b>" + pred["chosen_team"] + "</b> @ " + str(round(entry * 100)) + "c"
+            icon + " <a href=\"" + pred["market_url"] + "\">" + question + "</a>\n"
+            + "   Pick: <b>" + chosen + "</b> @ " + str(round(entry * 100)) + "c"
             + price_info + "\n"
             + match_time
-            + "   🕐 Picked: " + ts + "\n\n"
+            + "   🕐 " + ts + "\n\n"
         )
 
     if len(text) > 4000:
         text = text[:4000] + "..."
 
-    await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
+    try:
+        await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
+    except Exception as e:
+        log.warning("mystats send error: %s", e)
+        # Отправляем упрощённую версию без HTML если парсинг упал
+        await message.answer(
+            "📊 Stats: " + str(stats["wins"]) + "W / " + str(stats["losses"]) + "L | "
+            "Win rate: " + str(stats["win_rate"]) + "% | P&L: " + pnl_str + "$"
+        )
 
 
 @dp.message(Command("ranking"))
@@ -845,8 +857,8 @@ async def cb_pick(callback: types.CallbackQuery):
         return
 
     teams = extract_teams(market)
-    if chosen_idx >= len(teams):
-        await callback.answer("Error", show_alert=True)
+    if not teams or chosen_idx >= len(teams):
+        await callback.answer("Market is no longer available", show_alert=True)
         return
 
     chosen_team = teams[chosen_idx]

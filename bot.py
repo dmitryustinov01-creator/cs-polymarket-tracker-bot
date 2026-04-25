@@ -19,7 +19,7 @@ HLTV_UPDATE_INTERVAL = 3600
 PAPER_BET_SIZE = 10.0
 
 # Файлы для хранения данных между рестартами
-DATA_DIR = os.getenv("DATA_DIR", "/data")
+DATA_DIR = os.getenv("DATA_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
 PREDICTIONS_FILE = os.path.join(DATA_DIR, "predictions.json")
 SUBSCRIBERS_FILE = os.path.join(DATA_DIR, "subscribers.json")
 KNOWN_MARKETS_FILE = os.path.join(DATA_DIR, "known_markets.json")
@@ -648,7 +648,22 @@ async def cmd_list(message: types.Message):
     async with aiohttp.ClientSession() as session:
         await refresh_hltv(session)
         markets = await fetch_markets(session)
-    await msg.edit_text(list_text(markets), parse_mode="HTML", disable_web_page_preview=True)
+    if not markets:
+        await msg.edit_text("No active CS2 matches right now. Bot will notify when new matches appear 🔔")
+        return
+    await msg.edit_text(
+        "<b>🎮 CS2 matches on Polymarket:</b> " + str(len(markets)) + " active\nTap a team to predict 👇",
+        parse_mode="HTML"
+    )
+    for m in markets[:15]:
+        question = m.get("question", "?")
+        line = matchup_line(m)
+        text = "<b>" + question[:80] + "</b>\n" + line
+        kb = prediction_keyboard(m)
+        await message.answer(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+        await asyncio.sleep(0.2)
+    if len(markets) > 15:
+        await message.answer("...and " + str(len(markets) - 15) + " more matches.")
 
 
 @dp.message(Command("mystats"))
@@ -745,8 +760,22 @@ async def cb_list(callback: types.CallbackQuery):
     async with aiohttp.ClientSession() as session:
         await refresh_hltv(session)
         markets = await fetch_markets(session)
-    await callback.message.answer(list_text(markets), parse_mode="HTML",
-                                  disable_web_page_preview=True)
+    if not markets:
+        await callback.message.answer("No active CS2 matches right now 🔔")
+        return
+    await callback.message.answer(
+        "<b>🎮 CS2 matches on Polymarket:</b> " + str(len(markets)) + " active\nTap a team to predict 👇",
+        parse_mode="HTML"
+    )
+    for m in markets[:15]:
+        question = m.get("question", "?")
+        line = matchup_line(m)
+        text = "<b>" + question[:80] + "</b>\n" + line
+        kb = prediction_keyboard(m)
+        await callback.message.answer(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+        await asyncio.sleep(0.2)
+    if len(markets) > 15:
+        await callback.message.answer("...and " + str(len(markets) - 15) + " more matches.")
 
 
 @dp.callback_query(lambda c: c.data == "ranking")

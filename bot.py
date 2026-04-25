@@ -734,11 +734,15 @@ async def cmd_mystats(message: types.Message):
         if not pred.get("outcome"):
             price_info = " | now " + str(round(last * 100)) + "c (" + delta_str + ")"
 
+        end_dt = pred.get("end_dt", "")
+        match_time = ("   📅 Match: " + end_dt + " UTC\n") if end_dt else ""
+
         text += (
             icon + " <a href=\"" + pred["market_url"] + "\">" + pred["question"][:45] + "</a>\n"
             + "   Pick: <b>" + pred["chosen_team"] + "</b> @ " + str(round(entry * 100)) + "c"
             + price_info + "\n"
-            + "   🕐 " + ts + "\n\n"
+            + match_time
+            + "   🕐 Picked: " + ts + "\n\n"
         )
 
     if len(text) > 4000:
@@ -852,6 +856,12 @@ async def cb_pick(callback: types.CallbackQuery):
     if chat_id not in predictions:
         predictions[chat_id] = {}
 
+    end_raw = market.get("endDate", "")
+    try:
+        end_dt = datetime.fromisoformat(end_raw.replace("Z", "+00:00")).strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        end_dt = ""
+
     predictions[chat_id][market_id] = {
         "question": market.get("question", "?"),
         "chosen_team": chosen_team,
@@ -860,6 +870,7 @@ async def cb_pick(callback: types.CallbackQuery):
         "last_price": entry_price,
         "market_url": market_url(market),
         "ts": datetime.now(timezone.utc).isoformat(),
+        "end_dt": end_dt,
         "outcome": None,
     }
     save_predictions()

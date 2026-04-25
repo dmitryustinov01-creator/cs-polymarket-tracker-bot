@@ -272,41 +272,68 @@ def prediction_keyboard(market):
     ]])
 
 
-def now_str():
-    return datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
+def format_match_time(market):
+    """Время матча из startDate или endDate."""
+    for field in ("startDate", "startDateIso", "endDate"):
+        raw = market.get(field, "")
+        if raw:
+            try:
+                dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                return dt.strftime("%d.%m.%Y %H:%M UTC")
+            except Exception:
+                pass
+    return "?"
 
 
 def new_market_text(market):
     question = market.get("question", "?")
     volume = format_volume(market)
-    end_raw = market.get("endDate", "")
-    try:
-        end_date = datetime.fromisoformat(end_raw.replace("Z", "+00:00")).strftime("%d.%m.%Y %H:%M UTC")
-    except Exception:
-        end_date = "?"
+    match_time = format_match_time(market)
     line = matchup_line(market)
     return (
         "<b>🎮 New CS2 match on Polymarket!</b>\n"
-        + "🕐 " + now_str() + "\n\n"
+        + "🕐 " + match_time + "\n\n"
         + question + "\n\n"
         + line + "\n\n"
-        + "Volume: " + volume + " | Closes: " + end_date + "\n\n"
+        + "Volume: " + volume + "\n\n"
         + "📊 Make your prediction:"
     )
 
 
-def list_text(markets):
-    if not markets:
-        return "No active CS2 matches right now. Bot will notify when new matches appear 🔔"
+PAGE_SIZE = 15
+
+# Кэш списка матчей для пагинации (chat_id -> list of markets)
+list_cache: dict = {}
+
+
+def list_page_text(markets, offset=0):
+    chunk = markets[offset:offset + PAGE_SIZE]
     lines = ["<b>🎮 CS2 matches on Polymarket:</b>\n"]
-    for m in markets[:15]:
+    for m in chunk:
         q = m.get("question", "?")[:60]
         url = market_url(m)
+        match_time = format_match_time(m)
         line = matchup_line(m)
-        lines.append("- <a href=\"" + url + "\">" + q + "</a>\n  " + line)
-    if len(markets) > 15:
-        lines.append("\n...and " + str(len(markets) - 15) + " more")
+        lines.append(
+            "- <a href=\"" + url + "\">" + q + "</a>\n"
+            "  🕐 " + match_time + "\n"
+            "  " + line
+        )
     return "\n\n".join(lines)
+
+
+def list_page_keyboard(total, offset=0):
+    """Кнопка 'Show more' если есть ещё матчи."""
+    shown = min(offset + PAGE_SIZE, total)
+    remaining = total - shown
+    if remaining <= 0:
+        return None
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="📋 Show " + str(remaining) + " more",
+            callback_data="list_more:" + str(shown)
+        )
+    ]])
 
 
 # ─── HLTV ─────────────────────────────────────────────────────────────────────
@@ -667,6 +694,38 @@ async def cmd_stop(message: types.Message):
     await message.answer("Unsubscribed. /start to subscribe again.")
 
 
+# Кэш списка матчей для пагинации (chat_id -> list)
+list_cache: dict = {}
+
+
+def render_list_page(markets, offset=0):
+    PAGE = 15
+    chunk = markets[offset:offset + PAGE]
+    lines = ["<b>🎮 CS2 matches on Polymarket (" + str(len(markets)) + " total):</b>\n"]
+    for m in chunk:
+        q = m.get("question", "?")[:55]
+        url = market_url(m)
+        match_time = format_match_time(m)
+        line = matchup_line(m)
+        lines.append(
+            "- <a href=\"" + url + "\">" + q + "</a>\n"
+            "  🕐 " + match_time + "\n"
+            "  " + line
+        )
+    text = "\n\n".join(lines)
+    shown = offset + len(chunk)
+    remaining = len(markets) - shown
+    kb = None
+    if remaining > 0:
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="📋 Show " + str(remaining) + " more",
+                callback_data="list_more:" + str(shown)
+            )
+        ]])
+    return text, kb
+
+
 @dp.message(Command("list"))
 async def cmd_list(message: types.Message):
     msg = await message.answer("Loading CS2 matches...")
@@ -676,19 +735,9 @@ async def cmd_list(message: types.Message):
     if not markets:
         await msg.edit_text("No active CS2 matches right now. Bot will notify when new matches appear 🔔")
         return
-    await msg.edit_text(
-        "<b>🎮 CS2 matches on Polymarket:</b> " + str(len(markets)) + " active\nTap a team to predict 👇",
-        parse_mode="HTML"
-    )
-    for m in markets[:15]:
-        question = m.get("question", "?")
-        line = matchup_line(m)
-        text = "<b>" + question[:80] + "</b>\n" + line
-        kb = prediction_keyboard(m)
-        await message.answer(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
-        await asyncio.sleep(0.2)
-    if len(markets) > 15:
-        await message.answer("...and " + str(len(markets) - 15) + " more matches.")
+    list_cache[message.chat.id] = markets
+    text, kb = render_list_page(markets, offset=0)
+    await msg.edit_text(text, parse_mode="HTML", disable_web_page_preview=True, reply_markup=kb)
 
 
 @dp.message(Command("mystats"))
@@ -798,25 +847,24 @@ async def cmd_status(message: types.Message):
 @dp.callback_query(lambda c: c.data == "list")
 async def cb_list(callback: types.CallbackQuery):
     await callback.answer("Loading...")
-    async with aiohttp.ClientSession() as session:
-        await refresh_hltv(session)
-        markets = await fetch_markets(session)
+    await cmd_list(callback.message)
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("list_more:"))
+async def cb_list_more(callback: types.CallbackQuery):
+    await callback.answer()
+    chat_id = callback.message.chat.id
+    markets = list_cache.get(chat_id)
     if not markets:
-        await callback.message.answer("No active CS2 matches right now 🔔")
-        return
-    await callback.message.answer(
-        "<b>🎮 CS2 matches on Polymarket:</b> " + str(len(markets)) + " active\nTap a team to predict 👇",
-        parse_mode="HTML"
-    )
-    for m in markets[:15]:
-        question = m.get("question", "?")
-        line = matchup_line(m)
-        text = "<b>" + question[:80] + "</b>\n" + line
-        kb = prediction_keyboard(m)
-        await callback.message.answer(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
-        await asyncio.sleep(0.2)
-    if len(markets) > 15:
-        await callback.message.answer("...and " + str(len(markets) - 15) + " more matches.")
+        async with aiohttp.ClientSession() as session:
+            markets = await fetch_markets(session)
+        list_cache[chat_id] = markets
+    try:
+        offset = int(callback.data.split(":")[1])
+    except Exception:
+        offset = 0
+    text, kb = render_list_page(markets, offset=offset)
+    await callback.message.answer(text, parse_mode="HTML", disable_web_page_preview=True, reply_markup=kb)
 
 
 @dp.callback_query(lambda c: c.data == "ranking")

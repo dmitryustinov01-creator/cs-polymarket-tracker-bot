@@ -726,6 +726,33 @@ def render_list_page(markets, offset=0):
     return text, kb
 
 
+async def send_list_page(message, markets, offset=0):
+    """Отправляет страницу матчей — каждый матч отдельным сообщением с кнопками."""
+    PAGE = 15
+    chunk = markets[offset:offset + PAGE]
+    for m in chunk:
+        question = m.get("question", "?")
+        match_time = format_match_time(m)
+        line = matchup_line(m)
+        text = "<b>" + question[:80] + "</b>\n🕐 " + match_time + "\n\n" + line
+        kb = prediction_keyboard(m)
+        await message.answer(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+        await asyncio.sleep(0.2)
+    shown = offset + len(chunk)
+    remaining = len(markets) - shown
+    if remaining > 0:
+        kb_more = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="📋 Show " + str(remaining) + " more",
+                callback_data="list_more:" + str(shown)
+            )
+        ]])
+        await message.answer(
+            "Showing " + str(shown) + " of " + str(len(markets)) + " matches.",
+            reply_markup=kb_more
+        )
+
+
 @dp.message(Command("list"))
 async def cmd_list(message: types.Message):
     msg = await message.answer("Loading CS2 matches...")
@@ -736,8 +763,11 @@ async def cmd_list(message: types.Message):
         await msg.edit_text("No active CS2 matches right now. Bot will notify when new matches appear 🔔")
         return
     list_cache[message.chat.id] = markets
-    text, kb = render_list_page(markets, offset=0)
-    await msg.edit_text(text, parse_mode="HTML", disable_web_page_preview=True, reply_markup=kb)
+    await msg.edit_text(
+        "<b>🎮 CS2 matches on Polymarket</b> — " + str(len(markets)) + " active\nTap a team to make a prediction 👇",
+        parse_mode="HTML"
+    )
+    await send_list_page(message, markets, offset=0)
 
 
 @dp.message(Command("mystats"))
@@ -863,8 +893,7 @@ async def cb_list_more(callback: types.CallbackQuery):
         offset = int(callback.data.split(":")[1])
     except Exception:
         offset = 0
-    text, kb = render_list_page(markets, offset=offset)
-    await callback.message.answer(text, parse_mode="HTML", disable_web_page_preview=True, reply_markup=kb)
+    await send_list_page(callback.message, markets, offset=offset)
 
 
 @dp.callback_query(lambda c: c.data == "ranking")

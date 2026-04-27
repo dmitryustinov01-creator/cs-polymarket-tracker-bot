@@ -12,11 +12,12 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeybo
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "120"))
-RESULT_CHECK_INTERVAL = 600
+RESULT_CHECK_INTERVAL = 120
 PRICE_CHECK_INTERVAL = 300
 PRICE_ALERT_THRESHOLD = 0.07
 HLTV_UPDATE_INTERVAL = 3600
-PAPER_BET_SIZE = 10.0
+PAPER_BET_SIZE = 5.0
+PAPER_BANK = 100.0
 
 # Файлы для хранения данных между рестартами
 DATA_DIR = os.getenv("DATA_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
@@ -273,8 +274,8 @@ def prediction_keyboard(market):
 
 
 def format_match_time(market):
-    """Время матча из startDate или endDate."""
-    for field in ("startDate", "startDateIso", "endDate"):
+    """Время окончания/дедлайн матча из endDate."""
+    for field in ("endDate", "endDateIso", "startDate"):
         raw = market.get(field, "")
         if raw:
             try:
@@ -492,16 +493,19 @@ async def check_price_changes(session):
 # ─── Result checking ──────────────────────────────────────────────────────────
 
 def get_winner_idx(market):
+    """Победитель определяется по closed=True + цена >= 0.95."""
+    if not market.get("closed"):
+        return None
     try:
         prices = market.get("outcomePrices", "[]")
         if isinstance(prices, str):
             prices = json.loads(prices)
         if prices and len(prices) >= 2:
-            p0 = round(float(prices[0]), 4)
-            p1 = round(float(prices[1]), 4)
-            if p0 == 1.0 and p1 == 0.0:
+            p0 = float(prices[0])
+            p1 = float(prices[1])
+            if p0 >= 0.95 and p1 <= 0.05:
                 return 0
-            if p0 == 0.0 and p1 == 1.0:
+            if p1 >= 0.95 and p0 <= 0.05:
                 return 1
     except Exception:
         pass
@@ -646,7 +650,7 @@ async def cmd_start(message: types.Message):
     kb = ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🎮 Matches"), KeyboardButton(text="📈 My Stats")],
-            [KeyboardButton(text="📊 HLTV Top-20"), KeyboardButton(text="ℹ️ Status")],
+            [KeyboardButton(text="📊 HLTV Top-30"), KeyboardButton(text="ℹ️ Status")],
         ],
         resize_keyboard=True,
         persistent=True,
@@ -657,7 +661,7 @@ async def cmd_start(message: types.Message):
         "Tap a team on match notifications to make paper predictions.\n\n"
         "/list - current CS2 matches\n"
         "/mystats - prediction stats\n"
-        "/ranking - HLTV top 20\n"
+        "/ranking - HLTV top 30\n"
         "/status - bot status\n"
         "/stop - unsubscribe",
         parse_mode="HTML",
@@ -677,7 +681,7 @@ async def btn_mystats(message: types.Message):
     await cmd_mystats(message)
 
 
-@dp.message(lambda m: m.text == "📊 HLTV Top-20")
+@dp.message(lambda m: m.text == "📊 HLTV Top-30")
 async def btn_ranking(message: types.Message):
     await cmd_ranking(message)
 
@@ -845,15 +849,27 @@ async def cmd_mystats(message: types.Message):
 @dp.message(Command("ranking"))
 async def cmd_ranking(message: types.Message):
     ranking = hltv_ranking if hltv_ranking else FALLBACK_RANKING
-    top = sorted(ranking.items(), key=lambda x: x[1])[:20]
-    lines = ["<b>HLTV Top-20:</b>\n"]
+    top = sorted(ranking.items(), key=lambda x: x[1])[:30]
+    # Убираем дубликаты по рангу
     seen_ranks = set()
+    unique = []
     for name, rank in top:
         if rank not in seen_ranks:
             seen_ranks.add(rank)
-            lines.append("#" + str(rank) + " " + name.title())
-    lines.append("\nSource: " + ("live HLTV" if hltv_ranking else "fallback"))
-    await message.answer("\n".join(lines), parse_mode="HTML")
+            unique.append((rank, name))
+    source = "live HLTV" if hltv_ranking else "fallback"
+    # Первое сообщение: #1-15
+    lines1 = ["<b>📊 HLTV Top 1-15:</b>\n"]
+    for rank, name in unique[:15]:
+        lines1.append("#" + str(rank) + " " + name.title())
+    await message.answer("\n".join(lines1), parse_mode="HTML")
+    # Второе сообщение: #16-30
+    if len(unique) > 15:
+        lines2 = ["<b>📊 HLTV Top 16-30:</b>\n"]
+        for rank, name in unique[15:30]:
+            lines2.append("#" + str(rank) + " " + name.title())
+        lines2.append("\nSource: " + source)
+        await message.answer("\n".join(lines2), parse_mode="HTML")
 
 
 @dp.message(Command("status"))

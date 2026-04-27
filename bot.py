@@ -575,11 +575,22 @@ def get_user_stats(chat_id):
         else:
             total_pnl -= PAPER_BET_SIZE
 
+    # Банк = стартовый - все сделанные ставки + возврат выигрышей
+    # Pending ставки уже "в игре" — вычитаем их из банка
+    spent = total * PAPER_BET_SIZE          # потрачено на все ставки
+    returned = 0.0                           # возвращено с завершённых
+    for p in finished:
+        if p["outcome"] == "win":
+            returned += PAPER_BET_SIZE * (1.0 / p["entry_price"])  # ставка + выигрыш
+        # loss — ничего не возвращается
+    current_bank = round(PAPER_BANK - spent + returned, 2)
+
     return {
         "total": total, "finished": len(finished),
         "wins": wins, "losses": losses,
         "pending": pending, "win_rate": win_rate,
         "total_pnl": round(total_pnl, 2),
+        "current_bank": current_bank,
         "preds": user_preds,
     }
 
@@ -784,7 +795,7 @@ async def cmd_mystats(message: types.Message):
         return
 
     pnl_str = ("+" if stats["total_pnl"] >= 0 else "") + str(stats["total_pnl"])
-    current_bank = round(PAPER_BANK + stats["total_pnl"], 2)
+    current_bank = stats["current_bank"]
     bets_in_play = stats["pending"] * PAPER_BET_SIZE
     text = (
         "<b>📊 Your prediction stats</b>\n\n"

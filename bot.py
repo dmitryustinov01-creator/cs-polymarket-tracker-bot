@@ -784,13 +784,17 @@ async def cmd_mystats(message: types.Message):
         return
 
     pnl_str = ("+" if stats["total_pnl"] >= 0 else "") + str(stats["total_pnl"])
+    current_bank = round(PAPER_BANK + stats["total_pnl"], 2)
+    bets_in_play = stats["pending"] * PAPER_BET_SIZE
     text = (
         "<b>📊 Your prediction stats</b>\n\n"
-        "Total: " + str(stats["total"]) + " | Pending: " + str(stats["pending"]) + "\n\n"
+        "💰 Bank: <b>$" + str(current_bank) + "</b> / $" + str(int(PAPER_BANK)) + "\n"
+        "🎯 Bet size: $" + str(int(PAPER_BET_SIZE)) + " | In play: $" + str(int(bets_in_play)) + "\n\n"
+        "Total picks: " + str(stats["total"]) + " | Pending: " + str(stats["pending"]) + "\n"
         "✅ Wins: " + str(stats["wins"]) + "\n"
         "❌ Losses: " + str(stats["losses"]) + "\n"
-        "Win rate: <b>" + str(stats["win_rate"]) + "%</b>\n\n"
-        "Paper P&amp;L ($10/bet): <b>" + pnl_str + "$</b>\n\n"
+        "Win rate: <b>" + str(stats["win_rate"]) + "%</b>\n"
+        "P&amp;L: <b>" + pnl_str + "$</b>\n\n"
         "─────────────────\n"
         "<b>Your picks:</b>\n\n"
     )

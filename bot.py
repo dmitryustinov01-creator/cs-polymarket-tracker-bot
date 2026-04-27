@@ -211,15 +211,32 @@ def market_url(market):
     return "https://polymarket.com/event/" + str(slug)
 
 
+ACADEMY_SUFFIXES = ["junior", "academy", "young", "youth", "rookies", " ii", "alter", " 2", "young blood"]
+
+def is_academy_team(name):
+    """Академии и молодёжки не получают рейтинг основной команды."""
+    n = name.strip().lower()
+    return any(s in n for s in ACADEMY_SUFFIXES)
+
 def get_team_rank(name):
     if not name:
         return ""
+    # Академии не получают рейтинг основной команды
+    if is_academy_team(name):
+        return ""
     ranking = hltv_ranking if hltv_ranking else FALLBACK_RANKING
     n = name.strip().lower()
+    # Точное совпадение
     if n in ranking:
         return "#" + str(ranking[n])
+    # Частичное — только если совпадение достаточно точное (длина ключа >= 4)
     for key, rank in ranking.items():
-        if key in n or n in key:
+        if len(key) >= 4 and (key == n or n == key):
+            return "#" + str(rank)
+        # Ключ входит в имя — только если имя не длиннее ключа более чем на 3 символа
+        if key in n and len(n) - len(key) <= 3:
+            return "#" + str(rank)
+        if n in key and len(key) - len(n) <= 3:
             return "#" + str(rank)
     return ""
 

@@ -20,6 +20,7 @@ from datetime import datetime, timezone, timedelta
 import aiohttp
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 
@@ -649,18 +650,44 @@ async def daily_summary_loop():
 
 # ─── TELEGRAM COMMANDS ───────────────────────────────────────────────────────
 
+MAIN_KB = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="📊 Статус"),    KeyboardButton(text="📂 Ставки")],
+        [KeyboardButton(text="📜 История"),   KeyboardButton(text="📈 HLTV")],
+    ],
+    resize_keyboard=True,
+    persistent=True,
+)
+
 @dp.message(Command("start"))
 async def cmd_start(msg: types.Message):
     await msg.answer(
         "🤖 <b>CS2 Auto Prediction Bot</b>\n\n"
         "Автоматически анализирует CS2 матчи через Elo-модель "
-        "и делает бумажные ставки.\n\n"
-        "/status   — статистика бота\n"
-        "/open     — открытые ставки\n"
-        "/history  — последние 10 закрытых\n"
-        "/ranking  — HLTV топ-20",
+        "и делает бумажные ставки по Quarter Kelly.\n\n"
+        "📊 Статус   — текущий банк и P&L\n"
+        "📂 Ставки   — открытые позиции\n"
+        "📜 История  — последние 10 закрытых\n"
+        "📈 HLTV     — топ-20 с Elo рейтингом",
         parse_mode="HTML",
+        reply_markup=MAIN_KB,
     )
+
+@dp.message(lambda m: m.text == "📊 Статус")
+async def btn_status(msg: types.Message):
+    await cmd_status(msg)
+
+@dp.message(lambda m: m.text == "📂 Ставки")
+async def btn_open(msg: types.Message):
+    await cmd_open(msg)
+
+@dp.message(lambda m: m.text == "📜 История")
+async def btn_history(msg: types.Message):
+    await cmd_history(msg)
+
+@dp.message(lambda m: m.text == "📈 HLTV")
+async def btn_ranking(msg: types.Message):
+    await cmd_ranking(msg)
 
 @dp.message(Command("status"))
 async def cmd_status(msg: types.Message):

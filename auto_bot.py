@@ -1067,6 +1067,33 @@ async def cb_ranking(callback: types.CallbackQuery):
 
 # ─── ENTRY POINT ─────────────────────────────────────────────────────────────
 
+async def safe_loop(name: str, coro_fn, restart_delay: int = 60):
+    """
+    Обёртка для любого loop — при падении логирует ошибку,
+    уведомляет в Telegram и перезапускает через restart_delay секунд.
+    Polling не перезапускаем — он управляется aiogram сам.
+    """
+    while True:
+        try:
+            log.info("Loop '%s' starting", name)
+            await coro_fn()
+        except asyncio.CancelledError:
+            log.info("Loop '%s' cancelled", name)
+            return
+        except Exception as e:
+            log.error("Loop '%s' crashed: %s", name, e, exc_info=True)
+            try:
+                await bot.send_message(
+                    CHAT_ID,
+                    f"⚠️ <b>Loop '{name}' упал</b>\n"
+                    f"Ошибка: <code>{str(e)[:200]}</code>\n"
+                    f"Перезапуск через {restart_delay}с...",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(restart_delay)
+
 async def main():
     await notify(
         f"🤖 <b>CS2 Auto Bot запущен</b>  [PAPER]\n\n"
@@ -1080,10 +1107,10 @@ async def main():
     )
 
     await asyncio.gather(
-        dp.start_polling(bot),
-        scan_loop(),
-        monitor_loop(),
-        daily_summary_loop(),
+        dp.start_polling(bot),                              # polling самовосстанавливается
+        safe_loop("scan",    scan_loop,    restart_delay=60),
+        safe_loop("monitor", monitor_loop, restart_delay=30),
+        safe_loop("daily",   daily_summary_loop, restart_delay=60),
     )
 
 if __name__ == "__main__":

@@ -11,7 +11,6 @@ Env vars:
 """
 
 import asyncio
-import json
 import logging
 import os
 import re
@@ -24,13 +23,13 @@ from aiogram.types import (
     ReplyKeyboardMarkup, KeyboardButton,
     InlineKeyboardMarkup, InlineKeyboardButton,
 )
+import db
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 
 BOT_TOKEN  = os.environ["BOT_TOKEN"]
 CHAT_ID    = int(os.environ["CHAT_ID"])
 
-DATA_FILE          = "auto_portfolio.json"
 SCAN_INTERVAL      = 900    # 15 мин между сканами
 RESULT_INTERVAL    = 300    # 5 мин проверка результатов
 HLTV_INTERVAL      = 3600   # 1ч обновление HLTV
@@ -234,23 +233,6 @@ hltv_last_updated: datetime | None = None
 
 
 # ─── PORTFOLIO ────────────────────────────────────────────────────────────────
-
-def load_portfolio() -> dict:
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, encoding="utf-8") as f:
-            return json.load(f)
-    return {
-        "bank":      STARTING_BANK,
-        "open":      {},     # market_id -> bet dict
-        "closed":    [],     # list of closed bets
-        "stats": {
-            "bets": 0, "wins": 0, "losses": 0, "profit": 0.0,
-        },
-    }
-
-def save_portfolio(p: dict):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(p, f, indent=2, ensure_ascii=False)
 
 
 # ─── ELO MODEL ───────────────────────────────────────────────────────────────
@@ -724,7 +706,6 @@ async def scan_loop():
     seen_markets: set = set()
 
     async with aiohttp.ClientSession() as session:
-        # Заполняем seen на первом запуске — не ставим на старые
         await refresh_hltv(session)
         markets = await fetch_cs2_markets(session)
         for m in markets:
@@ -733,93 +714,65 @@ async def scan_loop():
 
         while True:
             await asyncio.sleep(SCAN_INTERVAL)
-            try:
-                await refresh_hltv(session)
-                markets = await fetch_cs2_markets(session)
-                portfolio = load_portfolio()
+            await refresh_hltv(session)
+            markets = await fetch_cs2_markets(session)
+            portfolio = await db.get_portfolio()
 
-                for market in markets:
-                    mid = str(market.get("id", ""))
-                    if not mid:
-                        continue
+            for market in markets:
+                mid = str(market.get("id", ""))
+                if not mid or mid in seen_markets:
+                    continue
+                seen_markets.add(mid)
 
-                    # Уже видели этот рынок
-                    if mid in seen_markets:
-                        continue
-                    seen_markets.add(mid)
+                if mid in portfolio["open"]:
+                    continue
+                if get_volume(market) < MIN_VOLUME:
+                    continue
+                if len(portfolio["open"]) >= MAX_OPEN_BETS:
+                    log.info("Max open bets reached")
+                    break
 
-                    # Уже есть открытая ставка
-                    if mid in portfolio["open"]:
-                        continue
+                signal = evaluate_market(market)
+                if not signal:
+                    continue
 
-                    # Объём слишком маленький
-                    if get_volume(market) < MIN_VOLUME:
-                        continue
+                bet_size = quarter_kelly(
+                    signal["model_prob"],
+                    signal["market_prob"],
+                    portfolio["bank"],
+                )
+                if bet_size < MIN_BET_SIZE:
+                    continue
+                if portfolio["bank"] < bet_size:
+                    log.info("Not enough bank ($%.2f)", portfolio["bank"])
+                    break
 
-                    # Лимит открытых позиций
-                    if len(portfolio["open"]) >= MAX_OPEN_BETS:
-                        log.info("Max open bets reached")
-                        break
+                bet = {
+                    "question":       market.get("question", ""),
+                    "market_url":     market_url(market),
+                    "team":           signal["team"],
+                    "opponent":       signal["opponent"],
+                    "side_idx":       signal["side"],
+                    "rank":           signal["rank"],
+                    "opp_rank":       signal["opp_rank"],
+                    "rank_diff":      signal["rank_diff"],
+                    "model_prob":     signal["model_prob"],
+                    "market_prob":    signal["market_prob"],
+                    "edge":           signal["edge"],
+                    "bet_size":       bet_size,
+                    "potential_payout": round(bet_size / signal["market_prob"], 2),
+                }
 
-                    # Оцениваем через Elo-модель
-                    signal = evaluate_market(market)
-                    if not signal:
-                        continue
+                bank_after = portfolio["bank"] - bet_size
+                await db.open_bet(mid, bet, bank_after)
+                await notify_bet_opened(market, signal, bet_size, bank_after)
+                log.info("Bet opened: %s | edge %.2f | $%.2f",
+                         signal["team"], signal["edge"], bet_size)
 
-                    # Quarter Kelly размер ставки
-                    bet_size = quarter_kelly(
-                        signal["model_prob"],
-                        signal["market_prob"],
-                        portfolio["bank"],
-                    )
-                    if bet_size < MIN_BET_SIZE:
-                        log.info(
-                            "Bet too small ($%.2f) for %s, skip",
-                            bet_size, market.get("question", "")[:50],
-                        )
-                        continue
-
-                    if portfolio["bank"] < bet_size:
-                        log.info("Not enough bank ($%.2f)", portfolio["bank"])
-                        break
-
-                    # Открываем бумажную ставку
-                    teams = get_teams(market)
-                    prices = get_prices(market)
-
-                    bet = {
-                        "question":    market.get("question", ""),
-                        "market_url":  market_url(market),
-                        "team":        signal["team"],
-                        "opponent":    signal["opponent"],
-                        "side_idx":    signal["side"],
-                        "rank":        signal["rank"],
-                        "opp_rank":    signal["opp_rank"],
-                        "rank_diff":   signal["rank_diff"],
-                        "model_prob":  signal["model_prob"],
-                        "market_prob": signal["market_prob"],
-                        "edge":        signal["edge"],
-                        "bet_size":    bet_size,
-                        "potential_payout": round(
-                            bet_size / signal["market_prob"], 2
-                        ),
-                        "opened_at":   datetime.now(timezone.utc).isoformat(),
-                    }
-
-                    portfolio["open"][mid] = bet
-                    portfolio["bank"]     -= bet_size
-                    portfolio["stats"]["bets"] += 1
-                    save_portfolio(portfolio)
-
-                    await notify_bet_opened(market, signal, bet_size, portfolio["bank"])
-                    log.info(
-                        "Bet opened: %s | edge %.2f | $%.2f",
-                        signal["team"], signal["edge"], bet_size,
-                    )
-                    await asyncio.sleep(1)
-
-            except Exception as e:
-                log.error("scan_loop error: %s", e, exc_info=True)
+                # Обновляем локальную копию для следующей итерации
+                portfolio["open"][mid] = bet
+                portfolio["bank"] = bank_after
+                await asyncio.sleep(1)
 
 
 async def monitor_loop():
@@ -829,7 +782,7 @@ async def monitor_loop():
     async with aiohttp.ClientSession() as session:
         while True:
             try:
-                portfolio = load_portfolio()
+                portfolio = await db.get_portfolio()
 
                 for mid, bet in list(portfolio["open"].items()):
                     market = await fetch_market(session, mid)
@@ -841,41 +794,20 @@ async def monitor_loop():
                         continue
 
                     won = (winner_idx == bet["side_idx"])
+                    closed_bet = await db.close_bet(mid, won)
+                    if not closed_bet:
+                        continue
 
-                    # Считаем P&L
-                    if won:
-                        payout = bet["potential_payout"]
-                        profit = round(payout - bet["bet_size"], 4)
-                        portfolio["stats"]["wins"] += 1
-                        portfolio["bank"] += payout
-                    else:
-                        profit = -bet["bet_size"]
-                        portfolio["stats"]["losses"] += 1
-                        # банк уже уменьшен при открытии
-
-                    portfolio["stats"]["profit"] = round(
-                        portfolio["stats"]["profit"] + profit, 4
-                    )
-
-                    closed_bet = {
-                        **bet,
-                        "won":       won,
-                        "profit":    profit,
-                        "closed_at": datetime.now(timezone.utc).isoformat(),
-                    }
-                    portfolio["closed"].append(closed_bet)
-                    del portfolio["open"][mid]
-                    save_portfolio(portfolio)
-
+                    # Получаем свежий портфель для актуального банка
+                    fresh = await db.get_portfolio()
                     await notify_bet_closed(
                         closed_bet, won,
-                        portfolio["bank"],
-                        portfolio["stats"],
+                        fresh["bank"],
+                        fresh["stats"],
                     )
-                    log.info(
-                        "Bet closed: %s | %s | $%+.2f",
-                        bet["team"], "WIN" if won else "LOSS", profit,
-                    )
+                    log.info("Bet closed: %s | %s | $%+.2f",
+                             bet["team"], "WIN" if won else "LOSS",
+                             closed_bet["profit"])
                     await asyncio.sleep(1)
 
             except Exception as e:
@@ -893,7 +825,7 @@ async def daily_summary_loop():
             next_9am += timedelta(days=1)
         await asyncio.sleep((next_9am - now).total_seconds())
         try:
-            portfolio = load_portfolio()
+            portfolio = await db.get_portfolio()
             await notify_daily(portfolio)
         except Exception as e:
             log.error("daily summary error: %s", e)
@@ -942,7 +874,7 @@ async def btn_ranking(msg: types.Message):
 
 @dp.message(Command("status"))
 async def cmd_status(msg: types.Message):
-    portfolio = load_portfolio()
+    portfolio = await db.get_portfolio()
     stats     = portfolio["stats"]
     total     = stats["wins"] + stats["losses"]
     win_rate  = stats["wins"] / total * 100 if total else 0
@@ -951,8 +883,7 @@ async def cmd_status(msg: types.Message):
     pnl_s     = f"+${pnl:.2f}" if pnl >= 0 else f"−${abs(pnl):.2f}"
     delta     = portfolio["bank"] + invested - STARTING_BANK
     delta_s   = f"+${delta:.2f}" if delta >= 0 else f"−${abs(delta):.2f}"
-
-    hltv_src = "live" if hltv_ranking else "fallback"
+    hltv_src  = "live" if hltv_ranking else "fallback"
 
     await msg.answer(
         f"📊 <b>Bot Status</b>\n\n"
@@ -973,7 +904,7 @@ async def cmd_status(msg: types.Message):
 
 @dp.message(Command("open"))
 async def cmd_open(msg: types.Message):
-    portfolio = load_portfolio()
+    portfolio = await db.get_portfolio()
     open_bets = portfolio["open"]
 
     if not open_bets:
@@ -982,7 +913,7 @@ async def cmd_open(msg: types.Message):
 
     lines = [f"📂 <b>Открытые ставки ({len(open_bets)}):</b>\n"]
     for mid, bet in open_bets.items():
-        ts = bet["opened_at"][:10]
+        ts = str(bet.get("opened_at", ""))[:10]
         lines.append(
             f"🎯 <b>{bet['team']}</b> vs {bet['opponent']}\n"
             f"   #{bet['rank']} vs #{bet['opp_rank']} "
@@ -1000,15 +931,14 @@ async def cmd_open(msg: types.Message):
 
 @dp.message(Command("history"))
 async def cmd_history(msg: types.Message):
-    portfolio = load_portfolio()
-    closed    = portfolio["closed"][-10:]
+    closed = await db.get_closed_bets(10)
 
     if not closed:
         await msg.answer("📭 Нет закрытых ставок.")
         return
 
     lines = [f"📜 <b>Последние {len(closed)} ставок:</b>\n"]
-    for bet in reversed(closed):
+    for bet in closed:
         emoji  = "✅" if bet["won"] else "❌"
         profit = bet["profit"]
         p_str  = f"+${profit:.2f}" if profit >= 0 else f"−${abs(profit):.2f}"
@@ -1095,6 +1025,9 @@ async def safe_loop(name: str, coro_fn, restart_delay: int = 60):
             await asyncio.sleep(restart_delay)
 
 async def main():
+    await db.init_db()
+    log.info("Database initialized")
+
     await notify(
         f"🤖 <b>CS2 Auto Bot запущен</b>  [PAPER]\n\n"
         f"⚙️ Параметры модели:\n"
@@ -1107,7 +1040,7 @@ async def main():
     )
 
     await asyncio.gather(
-        dp.start_polling(bot),                              # polling самовосстанавливается
+        dp.start_polling(bot),
         safe_loop("scan",    scan_loop,    restart_delay=60),
         safe_loop("monitor", monitor_loop, restart_delay=30),
         safe_loop("daily",   daily_summary_loop, restart_delay=60),

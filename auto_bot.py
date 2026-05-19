@@ -20,7 +20,10 @@ from datetime import datetime, timezone, timedelta
 import aiohttp
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import (
+    ReplyKeyboardMarkup, KeyboardButton,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+)
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 
@@ -389,12 +392,45 @@ async def fetch_market(session: aiohttp.ClientSession, market_id: str) -> dict |
     return None
 
 
+# ─── KEYBOARDS ───────────────────────────────────────────────────────────────
+
+def kb_market(url: str) -> InlineKeyboardMarkup:
+    """Инлайн-кнопка под уведомлением об открытой ставке."""
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🔗 Открыть рынок", url=url),
+        InlineKeyboardButton(text="📂 Мои ставки",   callback_data="cb_open"),
+    ]])
+
+def kb_closed(url: str) -> InlineKeyboardMarkup:
+    """Инлайн-кнопки под уведомлением о закрытой ставке."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🔗 Рынок",    url=url),
+            InlineKeyboardButton(text="📜 История",  callback_data="cb_history"),
+        ],
+        [
+            InlineKeyboardButton(text="📊 Статус",   callback_data="cb_status"),
+        ],
+    ])
+
+def kb_daily() -> InlineKeyboardMarkup:
+    """Инлайн-кнопки под дейли-саммари."""
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="📂 Ставки",   callback_data="cb_open"),
+        InlineKeyboardButton(text="📜 История",  callback_data="cb_history"),
+    ]])
+
+
 # ─── NOTIFICATIONS ───────────────────────────────────────────────────────────
 
-async def notify(text: str):
+async def notify(text: str, kb=None):
     try:
-        await bot.send_message(CHAT_ID, text, parse_mode="HTML",
-                               disable_web_page_preview=True)
+        await bot.send_message(
+            CHAT_ID, text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=kb,
+        )
     except Exception as e:
         log.error("notify error: %s", e)
 
@@ -404,6 +440,7 @@ async def notify_bet_opened(market: dict, signal: dict, bet_size: float,
     vol      = fmt_volume(get_volume(market))
     elo_str  = f"#{signal['rank']} vs #{signal['opp_rank']} (diff {signal['rank_diff']})"
     edge_pct = signal["edge"] * 100
+    url      = market_url(market)
 
     await notify(
         f"🤖 <b>AUTO BET PLACED</b>  [PAPER]\n\n"
@@ -415,7 +452,8 @@ async def notify_bet_opened(market: dict, signal: dict, bet_size: float,
         f"⚡ Edge:         +{edge_pct:.1f} цент\n\n"
         f"💵 Ставка:       <b>${bet_size:.2f}</b>\n"
         f"📦 Объём рынка:  {vol}\n"
-        f"🏦 Банк после:   <b>${bank_after:.2f}</b>"
+        f"🏦 Банк после:   <b>${bank_after:.2f}</b>",
+        kb=kb_market(url),
     )
 
 async def notify_bet_closed(bet: dict, won: bool, bank: float, stats: dict):
@@ -438,7 +476,8 @@ async def notify_bet_closed(bet: dict, won: bool, bank: float, stats: dict):
         f"├ Банк:     <b>${bank:.2f}</b>\n"
         f"├ Сделок:   {total}\n"
         f"├ Win rate: {win_rate:.0f}%\n"
-        f"└ P&L всего: <b>{pnl_str}</b>"
+        f"└ P&L всего: <b>{pnl_str}</b>",
+        kb=kb_closed(bet["market_url"]),
     )
 
 async def notify_daily(portfolio: dict):
@@ -461,7 +500,8 @@ async def notify_daily(portfolio: dict):
         f"✅ Побед:    {stats['wins']}"
         f"  |  ❌ Поражений: {stats['losses']}\n"
         f"🎯 Win rate: {win_rate:.0f}%\n"
-        f"💵 P&L:      <b>{pnl_s}</b>"
+        f"💵 P&L:      <b>{pnl_s}</b>",
+        kb=kb_daily(),
     )
 
 
@@ -789,6 +829,29 @@ async def cmd_ranking(msg: types.Message):
         lines.append(f"#{rank}  {name}  <i>(Elo {elo:.0f})</i>")
 
     await msg.answer("\n".join(lines), parse_mode="HTML")
+
+
+# ─── INLINE CALLBACKS ────────────────────────────────────────────────────────
+
+@dp.callback_query(lambda c: c.data == "cb_status")
+async def cb_status(callback: types.CallbackQuery):
+    await callback.answer()
+    await cmd_status(callback.message)
+
+@dp.callback_query(lambda c: c.data == "cb_open")
+async def cb_open(callback: types.CallbackQuery):
+    await callback.answer()
+    await cmd_open(callback.message)
+
+@dp.callback_query(lambda c: c.data == "cb_history")
+async def cb_history(callback: types.CallbackQuery):
+    await callback.answer()
+    await cmd_history(callback.message)
+
+@dp.callback_query(lambda c: c.data == "cb_ranking")
+async def cb_ranking(callback: types.CallbackQuery):
+    await callback.answer()
+    await cmd_ranking(callback.message)
 
 
 # ─── ENTRY POINT ─────────────────────────────────────────────────────────────

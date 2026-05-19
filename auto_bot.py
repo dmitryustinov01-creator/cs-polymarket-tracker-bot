@@ -58,17 +58,165 @@ EXCLUDE_WORDS = [
 ]
 
 FALLBACK_RANKING = {
-    "vitality": 1, "natus vincere": 2, "navi": 2,
-    "faze": 3, "faze clan": 3, "g2": 4, "g2 esports": 4,
-    "spirit": 5, "team spirit": 5, "liquid": 6, "team liquid": 6,
-    "mouz": 7, "heroic": 8, "astralis": 9, "nip": 10,
-    "complexity": 11, "ence": 12, "cloud9": 13, "big": 14,
-    "eternal fire": 15, "fnatic": 16, "pain": 17, "3dmax": 18,
-    "mibr": 19, "virtus.pro": 21, "flyquest": 22, "monte": 23,
-    "saw": 24, "apeks": 25, "b8": 26, "betboom": 27,
-    "betboom team": 27, "parivision": 28, "aurora": 29,
-    "100 thieves": 30, "falcons": 31, "team falcons": 31,
+    # ── Топ 10 ────────────────────────────────────────────────────────────
+    "vitality": 1, "team vitality": 1,
+    "natus vincere": 2, "navi": 2,
+    "faze": 3, "faze clan": 3,
+    "g2": 4, "g2 esports": 4,
+    "spirit": 5, "team spirit": 5,
+    "liquid": 6, "team liquid": 6,
+    "mouz": 7, "mousesports": 7,
+    "heroic": 8,
+    "astralis": 9,
+    "nip": 10, "ninjas in pyjamas": 10,
+
+    # ── Топ 11–30 ─────────────────────────────────────────────────────────
+    "complexity": 11, "col": 11,
+    "ence": 12,
+    "cloud9": 13, "c9": 13,
+    "big": 14,
+    "eternal fire": 15,
+    "fnatic": 16,
+    "pain": 17, "pain gaming": 17,
+    "3dmax": 18,
+    "mibr": 19,
+    "paiN": 20,
+    "virtus.pro": 21, "vp": 21,
+    "flyquest": 22,
+    "monte": 23,
+    "saw": 24,
+    "apeks": 25,
+    "b8": 26,
+    "betboom": 27, "betboom team": 27,
+    "parivision": 28,
+    "aurora": 29,
+    "100 thieves": 30, "100t": 30,
+
+    # ── Топ 31–60 ─────────────────────────────────────────────────────────
+    "falcons": 31, "team falcons": 31,
     "furia": 32,
+    "imperial": 33, "imperial esports": 33,
+    "9z": 34, "9z team": 34,
+    "og": 35,
+    "forze": 36,
+    "fluxo": 37,
+    "entropiq": 38,
+    "sprout": 39,
+    "passion ua": 40,
+    "ex-natus vincere": 41,
+    "wildcard": 42, "wildcard gaming": 42,
+    "gamerlegion": 43, "gl": 43,
+    "amkal": 44,
+    "pera": 45, "pera esports": 45,
+    "lynn vision": 46,
+    "tyloo": 47,
+    "rare atom": 48,
+    "the mongolz": 49, "mongolz": 49,
+    "red canids": 50,
+    "nouns": 51, "nouns esports": 51,
+    "sinners": 52,
+    "permitta": 53,
+    "illuminar": 54,
+    "nemiga": 55,
+    "havu": 56,
+    "sashi": 57,
+    "rooster": 58,
+    "nexus": 59,
+    "sagrado": 60,
+
+    # ── Топ 61–100 ────────────────────────────────────────────────────────
+    "bestia": 61,
+    "sharks": 62, "sharks esports": 62,
+    "anonymo": 63,
+    "endpoint": 64,
+    "intz": 65,
+    "vikings": 66,
+    "atk": 67,
+    "alliance": 68,
+    "copenhagen flames": 69, "copenhagen": 69,
+    "skade": 70,
+    "eclot": 71,
+    "navi junior": 72,
+    "young ninjas": 73,
+    "masonic": 74,
+    "benched heroes": 75,
+    "koi": 76,
+    "sangal": 77,
+    "iбerik": 78,
+    "metizport": 79,
+    "into the breach": 80, "itb": 80,
+    "lyngby vikings": 81,
+    "wopa": 82,
+    "zero tenacity": 83,
+    "rebels": 84, "rebels gaming": 84,
+    "dynamo eclot": 85,
+    "bald": 86,
+    "chosen5": 87,
+    "gmb": 88, "gmb esports": 88,
+    "steel helmet": 89,
+    "illuminati": 90,
+    "fragmatic": 91,
+    "verdant": 92,
+    "housebets": 93,
+    "timbermen": 94,
+    "mythic": 95,
+    "triumph": 96,
+    "bad news bears": 97,
+    "oxygen": 98,
+    "esic": 99,
+    "limitless": 100,
+
+    # ── Топ 101–150 ───────────────────────────────────────────────────────
+    "winstrike": 101,
+    "bravado": 102,
+    "white wolves": 103,
+    "tricked": 104,
+    "x-kom": 105,
+    "pwr": 106,
+    "orgless": 107,
+    "nizhny novgorod": 108,
+    "leks": 109,
+    "quazar": 110,
+    "sector one": 111,
+    "pompa": 112,
+    "afterlife": 113,
+    "antwerp giants": 114,
+    "e-sharks": 115,
+    "griffins": 116,
+    "ldlc": 117,
+    "izt": 118,
+    "karma": 119,
+    "snogard dragons": 120,
+    "project x": 121,
+    "bisons": 122,
+    "windigo": 123,
+    "spectral": 124,
+    "finest": 125,
+    "warthox": 126,
+    "raptors": 127,
+    "honvéd": 128,
+    "heimo": 129,
+    "live to win": 130,
+    "nolpenki": 131,
+    "arctic": 132,
+    "solid": 133,
+    "teamone": 134,
+    "eagles": 135,
+    "nitro.vl": 136,
+    "nexus gaming": 137,
+    "black dragons": 138,
+    "ex-imperial": 139,
+    "hardfeelings": 140,
+    "win a meal": 141,
+    "sabre": 142,
+    "aravt": 143,
+    "lv": 144,
+    "viperio": 145,
+    "rway": 146,
+    "amkal esports": 147,
+    "skyfire": 148,
+    "furia academy": 149,
+    "forest": 150,
 }
 
 logging.basicConfig(
@@ -119,19 +267,38 @@ def elo_win_prob(elo_a: float, elo_b: float) -> float:
     return 1.0 / (1.0 + 10 ** ((elo_b - elo_a) / 400.0))
 
 def get_rank(name: str) -> int | None:
-    """Ищет ранг команды в HLTV или fallback."""
+    """
+    Ищет ранг команды. Порядок поиска:
+    1. Точное совпадение
+    2. Один содержит другой (с допуском по длине)
+    3. Поиск по токенам (команда из 2+ слов)
+    """
+    if not name:
+        return None
+
     ranking = hltv_ranking if hltv_ranking else FALLBACK_RANKING
     n = name.strip().lower()
 
+    # 1. Точное совпадение
     if n in ranking:
         return ranking[n]
 
+    # 2. Один содержит другой
     for key, rank in ranking.items():
-        if len(key) >= 4:
-            if key in n and len(n) - len(key) <= 4:
+        if len(key) < 3:
+            continue
+        if key in n and len(n) - len(key) <= 5:
+            return rank
+        if n in key and len(key) - len(n) <= 5:
+            return rank
+
+    # 3. Поиск по первому значимому слову (длиннее 3 символов)
+    tokens = [t for t in n.split() if len(t) > 3]
+    for token in tokens:
+        for key, rank in ranking.items():
+            if token in key or key.startswith(token):
                 return rank
-            if n in key and len(key) - len(n) <= 4:
-                return rank
+
     return None
 
 def quarter_kelly(prob_model: float, prob_market: float, bank: float) -> float:
@@ -287,30 +454,74 @@ def evaluate_market(market: dict) -> dict | None:
 # ─── HLTV ─────────────────────────────────────────────────────────────────────
 
 async def fetch_hltv(session: aiohttp.ClientSession) -> dict:
+    """
+    Скрапит HLTV топ-30. Пробует несколько regex-паттернов
+    на случай изменения HTML структуры.
+    Итоговый рейтинг = merge(live данные, fallback) — чтобы
+    команды 31-150 всегда были доступны через fallback.
+    """
     ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    live: dict = {}
+
     try:
         async with session.get(
             "https://www.hltv.org/ranking/teams",
-            headers={"User-Agent": ua, "Accept-Language": "en-US,en;q=0.9"},
-            timeout=aiohttp.ClientTimeout(total=15),
+            headers={
+                "User-Agent":      ua,
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept":          "text/html,application/xhtml+xml",
+            },
+            timeout=aiohttp.ClientTimeout(total=20),
         ) as r:
-            if r.status != 200:
-                return FALLBACK_RANKING.copy()
-            html = await r.text()
-            ranking = {}
-            blocks = re.findall(
-                r'class="position">#(\d+).*?class="name">(.*?)<',
-                html, re.DOTALL,
-            )
-            for rank_str, name_raw in blocks:
-                name = re.sub(r"<[^>]+>", "", name_raw).strip().lower()
-                try:
-                    ranking[name] = int(rank_str)
-                except ValueError:
-                    pass
-            return ranking if ranking else FALLBACK_RANKING.copy()
-    except Exception:
-        return FALLBACK_RANKING.copy()
+            if r.status == 200:
+                html = await r.text()
+
+                # Паттерн 1 — старый формат
+                for rank_str, name_raw in re.findall(
+                    r'class="position">#(\d+).*?class="name">(.*?)<',
+                    html, re.DOTALL,
+                ):
+                    name = re.sub(r"<[^>]+>", "", name_raw).strip().lower()
+                    try:
+                        live[name] = int(rank_str)
+                    except ValueError:
+                        pass
+
+                # Паттерн 2 — новый формат (ranked-team блоки)
+                if len(live) < 10:
+                    for rank_str, name_raw in re.findall(
+                        r'ranked-team.*?ranking-header.*?#(\d+).*?'
+                        r'team-name["\s]+>([^<]+)<',
+                        html, re.DOTALL,
+                    ):
+                        name = name_raw.strip().lower()
+                        try:
+                            live[name] = int(rank_str)
+                        except ValueError:
+                            pass
+
+                # Паттерн 3 — data-атрибуты
+                if len(live) < 10:
+                    for rank_str, name_raw in re.findall(
+                        r'data-teamid[^>]*>.*?#(\d+).*?<span[^>]*>([^<]{2,40})</span>',
+                        html, re.DOTALL,
+                    ):
+                        name = name_raw.strip().lower()
+                        try:
+                            live[name] = int(rank_str)
+                        except ValueError:
+                            pass
+
+                log.info("HLTV live: %d teams parsed", len(live))
+
+    except Exception as e:
+        log.warning("HLTV fetch error: %s", e)
+
+    # Мержим: live перекрывает fallback для топ-30,
+    # fallback добавляет команды 31-150 которых нет в live
+    merged = dict(FALLBACK_RANKING)   # начинаем с полного fallback
+    merged.update(live)               # live данные побеждают где пересекаются
+    return merged
 
 async def refresh_hltv(session: aiohttp.ClientSession):
     global hltv_ranking, hltv_last_updated
@@ -322,7 +533,7 @@ async def refresh_hltv(session: aiohttp.ClientSession):
     ):
         hltv_ranking = await fetch_hltv(session)
         hltv_last_updated = now
-        log.info("HLTV updated: %d teams", len(hltv_ranking))
+        log.info("HLTV updated: %d teams total", len(hltv_ranking))
 
 
 # ─── GAMMA API ────────────────────────────────────────────────────────────────

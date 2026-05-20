@@ -11,6 +11,7 @@ Env vars:
 """
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -23,7 +24,16 @@ from aiogram.types import (
     ReplyKeyboardMarkup, KeyboardButton,
     InlineKeyboardMarkup, InlineKeyboardButton,
 )
-import db
+
+# Используем PostgreSQL если DATABASE_URL задан, иначе JSON файлы
+USE_DB = bool(os.environ.get("DATABASE_URL"))
+if USE_DB:
+    try:
+        import db
+    except ImportError:
+        USE_DB = False
+
+DATA_FILE = "auto_portfolio.json"
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 
@@ -232,7 +242,66 @@ hltv_ranking:      dict = {}
 hltv_last_updated: datetime | None = None
 
 
-# ─── PORTFOLIO ────────────────────────────────────────────────────────────────
+# ─── PORTFOLIO (JSON fallback / PostgreSQL) ───────────────────────────────────
+
+def _empty_portfolio() -> dict:
+    return {
+        "bank":  STARTING_BANK,
+        "open":  {},
+        "stats": {"bets": 0, "wins": 0, "losses": 0, "profit": 0.0},
+    }
+
+def _load_json() -> dict:
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    return _empty_portfolio()
+
+def _save_json(p: dict):
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(p, f, indent=2, ensure_ascii=False)
+
+async def portfolio_get() -> dict:
+    if USE_DB:
+        return await db.get_portfolio()
+    return _load_json()
+
+async def portfolio_open_bet(mid: str, bet: dict, bank_after: float):
+    if USE_DB:
+        await db.open_bet(mid, bet, bank_after)
+    else:
+        p = _load_json()
+        p["open"][mid] = {**bet, "opened_at": datetime.now(timezone.utc).isoformat()}
+        p["bank"] = bank_after
+        p["stats"]["bets"] += 1
+        _save_json(p)
+
+async def portfolio_close_bet(mid: str, won: bool) -> dict | None:
+    if USE_DB:
+        return await db.close_bet(mid, won)
+    p = _load_json()
+    bet = p["open"].pop(mid, None)
+    if not bet:
+        return None
+    profit = round(bet["potential_payout"] - bet["bet_size"], 4) if won else -bet["bet_size"]
+    payout = bet["potential_payout"] if won else 0.0
+    p["bank"] += payout
+    if won:
+        p["stats"]["wins"] += 1
+    else:
+        p["stats"]["losses"] += 1
+    p["stats"]["profit"] = round(p["stats"]["profit"] + profit, 4)
+    closed = {**bet, "won": won, "profit": profit,
+              "closed_at": datetime.now(timezone.utc).isoformat()}
+    p.setdefault("closed", []).append(closed)
+    _save_json(p)
+    return closed
+
+async def portfolio_get_closed(limit: int = 10) -> list:
+    if USE_DB:
+        return await db.get_closed_bets(limit)
+    p = _load_json()
+    return list(reversed(p.get("closed", [])[-limit:]))
 
 
 # ─── ELO MODEL ───────────────────────────────────────────────────────────────
@@ -716,7 +785,7 @@ async def scan_loop():
             await asyncio.sleep(SCAN_INTERVAL)
             await refresh_hltv(session)
             markets = await fetch_cs2_markets(session)
-            portfolio = await db.get_portfolio()
+            portfolio = await portfolio_get()
 
             for market in markets:
                 mid = str(market.get("id", ""))
@@ -764,12 +833,11 @@ async def scan_loop():
                 }
 
                 bank_after = portfolio["bank"] - bet_size
-                await db.open_bet(mid, bet, bank_after)
+                await portfolio_open_bet(mid, bet, bank_after)
                 await notify_bet_opened(market, signal, bet_size, bank_after)
                 log.info("Bet opened: %s | edge %.2f | $%.2f",
                          signal["team"], signal["edge"], bet_size)
 
-                # Обновляем локальную копию для следующей итерации
                 portfolio["open"][mid] = bet
                 portfolio["bank"] = bank_after
                 await asyncio.sleep(1)
@@ -782,7 +850,7 @@ async def monitor_loop():
     async with aiohttp.ClientSession() as session:
         while True:
             try:
-                portfolio = await db.get_portfolio()
+                portfolio = await portfolio_get()
 
                 for mid, bet in list(portfolio["open"].items()):
                     market = await fetch_market(session, mid)
@@ -794,12 +862,11 @@ async def monitor_loop():
                         continue
 
                     won = (winner_idx == bet["side_idx"])
-                    closed_bet = await db.close_bet(mid, won)
+                    closed_bet = await portfolio_close_bet(mid, won)
                     if not closed_bet:
                         continue
 
-                    # Получаем свежий портфель для актуального банка
-                    fresh = await db.get_portfolio()
+                    fresh = await portfolio_get()
                     await notify_bet_closed(
                         closed_bet, won,
                         fresh["bank"],
@@ -825,7 +892,7 @@ async def daily_summary_loop():
             next_9am += timedelta(days=1)
         await asyncio.sleep((next_9am - now).total_seconds())
         try:
-            portfolio = await db.get_portfolio()
+            portfolio = await portfolio_get()
             await notify_daily(portfolio)
         except Exception as e:
             log.error("daily summary error: %s", e)
@@ -874,7 +941,7 @@ async def btn_ranking(msg: types.Message):
 
 @dp.message(Command("status"))
 async def cmd_status(msg: types.Message):
-    portfolio = await db.get_portfolio()
+    portfolio = await portfolio_get()
     stats     = portfolio["stats"]
     total     = stats["wins"] + stats["losses"]
     win_rate  = stats["wins"] / total * 100 if total else 0
@@ -904,7 +971,7 @@ async def cmd_status(msg: types.Message):
 
 @dp.message(Command("open"))
 async def cmd_open(msg: types.Message):
-    portfolio = await db.get_portfolio()
+    portfolio = await portfolio_get()
     open_bets = portfolio["open"]
 
     if not open_bets:
@@ -931,7 +998,7 @@ async def cmd_open(msg: types.Message):
 
 @dp.message(Command("history"))
 async def cmd_history(msg: types.Message):
-    closed = await db.get_closed_bets(10)
+    closed = await portfolio_get_closed(10)
 
     if not closed:
         await msg.answer("📭 Нет закрытых ставок.")
@@ -1025,11 +1092,15 @@ async def safe_loop(name: str, coro_fn, restart_delay: int = 60):
             await asyncio.sleep(restart_delay)
 
 async def main():
-    await db.init_db()
-    log.info("Database initialized")
+    if USE_DB:
+        await db.init_db()
+        log.info("PostgreSQL initialized")
+    else:
+        log.info("Running in JSON mode (no DATABASE_URL)")
 
     await notify(
-        f"🤖 <b>CS2 Auto Bot запущен</b>  [PAPER]\n\n"
+        f"🤖 <b>CS2 Auto Bot запущен</b>  [PAPER]\n"
+        f"💾 Хранение: {'PostgreSQL' if USE_DB else 'JSON (локально)'}\n\n"
         f"⚙️ Параметры модели:\n"
         f"├ Min edge:       {MIN_EDGE*100:.0f} центов\n"
         f"├ Quarter Kelly:  {MAX_KELLY_FRACTION*100:.0f}%\n"

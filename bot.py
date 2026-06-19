@@ -14,7 +14,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 DATA_API = "https://data-api.polymarket.com"
 PAGE = 500          # лимит API на страницу
 MAX_PAGES = 40      # потолок пагинации (40×500 = 20000 записей)
-PAUSE = 0.25        # пауза между страницами
+PAUSE = 0.1         # пауза между страницами
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -251,34 +251,45 @@ def analysis_keyboard(is_weather_trader):
 # ─── Обработчик: разбор кошелька ──────────────────────────────────────────────
 
 async def run_analysis(message, wallet):
-    msg = await message.answer(f"⏳ Качаю историю {wallet[:10]}…\nЭто займёт минуту-две.")
-    async with aiohttp.ClientSession() as session:
-        # Закрытые позиции (limit 50!) — для P&L и винрейта
-        closed = await fetch_all(session, "closed-positions",
-                                 {"user": wallet, "sortBy": "TIMESTAMP"},
-                                 page_size=50, max_pages=400)
-        await msg.edit_text(f"⏳ Закрытых позиций: {len(closed)}. Качаю активные…")
-        # Активные позиции (limit 500) — для 'в игре'
-        active = await fetch_all(session, "positions",
-                                 {"user": wallet, "sizeThreshold": 0},
-                                 page_size=500, max_pages=40)
-        await msg.edit_text(f"⏳ Закрытых {len(closed)}, активных {len(active)}. "
-                            f"Качаю сделки…")
-        # Сделки (для паттерна держит/торгует)
-        trades = await fetch_all(session, "trades", {"user": wallet},
-                                 page_size=500, max_pages=40)
+    msg = await message.answer(f"⏳ Качаю историю {wallet[:12]}…")
+    try:
+        async with aiohttp.ClientSession() as session:
+            # Закрытые позиции — для P&L и винрейта. Берём ВЫБОРКУ до ~2500
+            # (50 страниц × 50): для статистики винрейта/зон этого достаточно,
+            # тянуть все 9000 слишком долго (Railway/Telegram оборвут).
+            closed = await fetch_all(session, "closed-positions",
+                                     {"user": wallet, "sortBy": "TIMESTAMP"},
+                                     page_size=50, max_pages=50)
+            await msg.edit_text(f"⏳ Закрытых: {len(closed)}. Активные…")
+            active = await fetch_all(session, "positions",
+                                     {"user": wallet, "sizeThreshold": 0},
+                                     page_size=500, max_pages=10)
+            await msg.edit_text(f"⏳ Закрытых {len(closed)}, активных {len(active)}. "
+                                f"Сделки…")
+            trades = await fetch_all(session, "trades", {"user": wallet},
+                                     page_size=500, max_pages=4)
 
-    if not closed and not active and not trades:
-        await msg.edit_text("❌ Ничего не нашёл. Проверь адрес кошелька.")
-        return
+        if not closed and not active and not trades:
+            await msg.edit_text("❌ Ничего не нашёл. Проверь адрес кошелька.")
+            return
 
-    text, is_w = build_analysis(closed, active, trades)
-    last_analysis[message.chat.id] = {
-        "closed": closed, "active": active, "trades": trades, "wallet": wallet}
-    await msg.delete()
-    await message.answer(text, parse_mode="HTML",
-                         reply_markup=analysis_keyboard(is_w),
-                         disable_web_page_preview=True)
+        text, is_w = build_analysis(closed, active, trades)
+        last_analysis[message.chat.id] = {
+            "closed": closed, "active": active, "trades": trades, "wallet": wallet}
+        # edit_text вместо delete+answer — если упадёт, юзер увидит хоть что-то.
+        # Кнопки отдельным сообщением.
+        if len(text) > 4000:
+            text = text[:4000]
+        await msg.edit_text(text, parse_mode="HTML",
+                            disable_web_page_preview=True)
+        await message.answer("Подробнее:", reply_markup=analysis_keyboard(is_w))
+    except Exception as e:
+        log.exception("run_analysis failed")
+        try:
+            await msg.edit_text(f"❌ Ошибка при разборе: {type(e).__name__}: {e}\n"
+                                f"Попробуй ещё раз.")
+        except Exception:
+            await message.answer(f"❌ Ошибка: {type(e).__name__}: {e}")
 
 
 @dp.message(Command("start"))

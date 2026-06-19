@@ -77,6 +77,11 @@ def city_of(title):
     return "?"
 
 
+def esc(s):
+    """Экранирует HTML-спецсимволы (названия рынков могут содержать < > &)."""
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
 def fmt_money(x):
     s = f"{x:+,.2f}"
     return s
@@ -107,7 +112,7 @@ def build_analysis(closed, active, trades):
         weather_share = w / len(allpos)
     is_weather_trader = weather_share >= 0.5
 
-    L = [f"📊 <b>{name}</b>"]
+    L = [f"📊 {esc(name)}"]
     if is_weather_trader:
         L.append(f"🌤 Погодный трейдер ({weather_share*100:.0f}% позиций)")
     L.append("")
@@ -120,11 +125,11 @@ def build_analysis(closed, active, trades):
     losses = [p for p in closed if float(p.get("realizedPnl", 0) or 0) < 0]
     invested = sum(float(p.get("totalBought", 0) or 0) for p in closed)
 
-    L.append(f"💰 Реализованный P&L: <b>${fmt_money(realized)}</b>")
+    L.append(f"💰 Реализованный P&L: ${fmt_money(realized)}")
     if invested > 0:
         L.append(f"   ROI: {realized/invested*100:+.0f}% (вложено ${invested:,.0f})")
     if nc:
-        L.append(f"📈 Винрейт: <b>{len(wins)}/{nc}</b> ({pct(len(wins), nc)}) по закрытым")
+        L.append(f"📈 Винрейт: {len(wins)}/{nc} ({pct(len(wins), nc)}) по закрытым")
     L.append(f"   ✅ {len(wins)} побед / ❌ {len(losses)} проигрышей")
 
     # Активные позиции — отдельно, НЕ в итог
@@ -149,7 +154,7 @@ def build_analysis(closed, active, trades):
             elif pr < 0.65: zones["50-65¢"] += 1
             else: zones["65¢+"] += 1
         top_zone = max(zones.items(), key=lambda kv: kv[1])
-        L.append(f"🎯 Вход: медиана <b>{med*100:.0f}¢</b>, "
+        L.append(f"🎯 Вход: медиана {med*100:.0f}¢, "
                  f"чаще {top_zone[0]} ({pct(top_zone[1], len(prices))})")
         zline = " ".join(f"{z}:{c}" for z,c in zones.items() if c)
         L.append(f"   {zline}")
@@ -159,15 +164,15 @@ def build_analysis(closed, active, trades):
         for p in closed:
             pr = float(p.get("avgPrice",0) or 0)
             rp = float(p.get("realizedPnl",0) or 0)
-            if pr < 0.15: z="дешёвые<15¢"
-            elif pr < 0.50: z="средние15-50¢"
-            else: z="дорогие50¢+"
+            if pr < 0.15: z="дешёвые до 15¢"
+            elif pr < 0.50: z="средние 15-50¢"
+            else: z="дорогие 50¢+"
             if z not in zone_stats: zone_stats[z]={"n":0,"w":0,"pnl":0.0}
             zone_stats[z]["n"]+=1
             zone_stats[z]["pnl"]+=rp
             if rp>0: zone_stats[z]["w"]+=1
         L.append("   P&L по зонам входа:")
-        for z in ["дешёвые<15¢","средние15-50¢","дорогие50¢+"]:
+        for z in ["дешёвые до 15¢","средние 15-50¢","дорогие 50¢+"]:
             if z in zone_stats:
                 s=zone_stats[z]
                 L.append(f"     {z}: {s['w']}/{s['n']} ${fmt_money(s['pnl'])}")
@@ -183,7 +188,7 @@ def build_analysis(closed, active, trades):
     sizes = [float(p.get("totalBought", 0) or 0) for p in closed if p.get("totalBought")]
     if sizes:
         med_s = sorted(sizes)[len(sizes)//2]
-        L.append(f"📏 Ставка: медиана <b>${med_s:.0f}</b> "
+        L.append(f"📏 Ставка: медиана ${med_s:.0f} "
                  f"(${min(sizes):.0f}–${max(sizes):.0f})")
     L.append("")
 
@@ -219,21 +224,21 @@ def build_cities(closed):
     if not by_city:
         return "Нет закрытых погодных позиций для разбора по городам."
     items = sorted(by_city.items(), key=lambda kv: -kv[1]["pnl"])
-    L = ["🏙 <b>По городам</b> (реализованный P&L):", ""]
+    L = ["🏙 По городам (реализованный P&L):", ""]
     for c, d in items[:25]:
         if d["n"] < 1: continue
         mark = "🟢" if d["pnl"] > 0 else "🔴"
-        L.append(f"{mark} {c}: {d['win']}/{d['n']} ${fmt_money(d['pnl'])}")
+        L.append(f"{mark} {esc(c)}: {d['win']}/{d['n']} ${fmt_money(d['pnl'])}")
     return "\n".join(L)
 
 
 def build_recent(trades, limit=15):
     """Последние сделки."""
-    L = ["🕐 <b>Последние сделки</b>:", ""]
+    L = ["🕐 Последние сделки:", ""]
     for t in trades[:limit]:
         side = t.get("side", "?")
         price = float(t.get("price", 0) or 0)
-        title = (t.get("title", "?") or "?")[:35]
+        title = esc((t.get("title", "?") or "?")[:35])
         out = t.get("outcome", "")
         emoji = "🟢" if side == "BUY" else "🔴"
         L.append(f"{emoji} {side} {out} @ {price*100:.0f}¢ — {title}")
@@ -280,16 +285,17 @@ async def run_analysis(message, wallet):
         # Кнопки отдельным сообщением.
         if len(text) > 4000:
             text = text[:4000]
-        await msg.edit_text(text, parse_mode="HTML",
+        await msg.edit_text(text,
                             disable_web_page_preview=True)
         await message.answer("Подробнее:", reply_markup=analysis_keyboard(is_w))
     except Exception as e:
         log.exception("run_analysis failed")
+        err = f"❌ Ошибка при разборе: {type(e).__name__}: {e}\nПопробуй ещё раз."
         try:
-            await msg.edit_text(f"❌ Ошибка при разборе: {type(e).__name__}: {e}\n"
-                                f"Попробуй ещё раз.")
+            # без parse_mode — ошибка может содержать спецсимволы
+            await msg.edit_text(err)
         except Exception:
-            await message.answer(f"❌ Ошибка: {type(e).__name__}: {e}")
+            await message.answer(err)
 
 
 @dp.message(Command("start"))
@@ -298,7 +304,7 @@ async def cmd_start(message: types.Message):
         keyboard=[[KeyboardButton(text="ℹ️ Как пользоваться")]],
         resize_keyboard=True, persistent=True)
     await message.answer(
-        "<b>🔍 Trader Check</b>\n\n"
+        "🔍 Trader Check\n\n"
         "Разбор любого трейдера Polymarket по кошельку.\n\n"
         "Просто пришли адрес кошелька (0x…) — и я выдам:\n"
         "• P&L, ROI, винрейт (с учётом проигравших)\n"
@@ -306,7 +312,7 @@ async def cmd_start(message: types.Message):
         "• Держит до резолюции или торгует\n"
         "• Для погодных — разбор по городам\n\n"
         "Или команда: /check 0x…",
-        parse_mode="HTML", reply_markup=kb)
+         reply_markup=kb)
 
 
 @dp.message(lambda m: m.text == "ℹ️ Как пользоваться")
@@ -342,7 +348,7 @@ async def cb_cities(callback: types.CallbackQuery):
         await callback.message.answer("Сначала пришли кошелёк.")
         return
     await callback.message.answer(build_cities(data["closed"]),
-                                  parse_mode="HTML", disable_web_page_preview=True)
+                                   disable_web_page_preview=True)
 
 
 @dp.callback_query(lambda c: c.data == "a:recent")
@@ -353,7 +359,7 @@ async def cb_recent(callback: types.CallbackQuery):
         await callback.message.answer("Сначала пришли кошелёк.")
         return
     await callback.message.answer(build_recent(data["trades"]),
-                                  parse_mode="HTML", disable_web_page_preview=True)
+                                   disable_web_page_preview=True)
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────

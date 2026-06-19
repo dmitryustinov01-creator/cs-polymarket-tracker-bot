@@ -30,13 +30,14 @@ WALLET_RE = re.compile(r"0x[a-fA-F0-9]{40}")
 
 # ─── Загрузка данных с пагинацией ─────────────────────────────────────────────
 
-async def fetch_all(session, endpoint, params):
-    """Качает все записи через offset-пагинацию."""
+async def fetch_all(session, endpoint, params, page_size, max_pages):
+    """Качает все записи через offset-пагинацию. page_size зависит от
+    endpoint: /positions и /trades = 500, /closed-positions = 50 (лимит API)."""
     out = []
     offset = 0
-    for _ in range(MAX_PAGES):
+    for _ in range(max_pages):
         p = dict(params)
-        p["limit"] = PAGE
+        p["limit"] = page_size
         p["offset"] = offset
         try:
             async with session.get(f"{DATA_API}/{endpoint}", params=p,
@@ -51,9 +52,9 @@ async def fetch_all(session, endpoint, params):
         if not batch:
             break
         out.extend(batch)
-        if len(batch) < PAGE:
+        if len(batch) < page_size:
             break
-        offset += PAGE
+        offset += page_size
         await asyncio.sleep(PAUSE)
     return out
 
@@ -87,21 +88,23 @@ def pct(part, whole):
 
 # ─── Главный разбор ───────────────────────────────────────────────────────────
 
-def build_analysis(positions, trades):
-    """Собирает текстовый разбор стратегии трейдера."""
+def build_analysis(closed, active, trades):
+    """Разбор стратегии. closed = закрытые (для P&L/винрейта),
+    active = текущие (для 'в игре'), trades = действия."""
     name = "?"
-    for t in trades:
-        if t.get("name"):
-            name = t["name"]; break
-    if name == "?":
-        for p in positions:
-            if p.get("name"):
-                name = p["name"]; break
+    for src in (trades, closed, active):
+        for t in src:
+            if t.get("name"):
+                name = t["name"]; break
+        if name != "?":
+            break
 
+    # Погодный? — по всем позициям
+    allpos = closed + active
     weather_share = 0
-    if positions:
-        w = sum(1 for p in positions if is_weather(p.get("title")))
-        weather_share = w / len(positions)
+    if allpos:
+        w = sum(1 for p in allpos if is_weather(p.get("title")))
+        weather_share = w / len(allpos)
     is_weather_trader = weather_share >= 0.5
 
     L = [f"📊 <b>{name}</b>"]
@@ -109,64 +112,87 @@ def build_analysis(positions, trades):
         L.append(f"🌤 Погодный трейдер ({weather_share*100:.0f}% позиций)")
     L.append("")
 
-    # ── P&L и винрейт по позициям ──
-    if positions:
-        n = len(positions)
-        cash = sum(float(p.get("cashPnl", 0) or 0) for p in positions)
-        realized = sum(float(p.get("realizedPnl", 0) or 0) for p in positions)
-        initial = sum(float(p.get("initialValue", 0) or 0) for p in positions)
-        wins = [p for p in positions if float(p.get("cashPnl", 0) or 0) > 0]
-        roi = f" ({cash/initial*100:+.0f}% ROI)" if initial > 0 else ""
-        L.append(f"💰 P&L: <b>${fmt_money(cash)}</b>{roi}")
-        if abs(realized) > 0.01:
-            L.append(f"   реализовано: ${fmt_money(realized)}")
-        L.append(f"📈 Винрейт: <b>{len(wins)}/{n}</b> ({pct(len(wins), n)})")
-        L.append(f"💵 Вложено: ${initial:,.0f}")
-        L.append("")
+    # ── P&L = реализованный по ЗАКРЫТЫМ позициям ──
+    nc = len(closed)
+    realized = sum(float(p.get("realizedPnl", 0) or 0) for p in closed)
+    # Винрейт по закрытым: выиграл = realizedPnl > 0
+    wins = [p for p in closed if float(p.get("realizedPnl", 0) or 0) > 0]
+    losses = [p for p in closed if float(p.get("realizedPnl", 0) or 0) < 0]
+    invested = sum(float(p.get("totalBought", 0) or 0) for p in closed)
 
-        # ── Зоны входа ──
-        prices = [float(p.get("avgPrice", 0) or 0) for p in positions if p.get("avgPrice")]
-        if prices:
-            med = sorted(prices)[len(prices)//2]
-            zones = {"1-5¢":0,"5-15¢":0,"15-35¢":0,"35-50¢":0,"50-65¢":0,"65¢+":0}
-            for pr in prices:
-                if pr < 0.05: zones["1-5¢"] += 1
-                elif pr < 0.15: zones["5-15¢"] += 1
-                elif pr < 0.35: zones["15-35¢"] += 1
-                elif pr < 0.50: zones["35-50¢"] += 1
-                elif pr < 0.65: zones["50-65¢"] += 1
-                else: zones["65¢+"] += 1
-            top_zone = max(zones.items(), key=lambda kv: kv[1])
-            L.append(f"🎯 Вход: медиана <b>{med*100:.0f}¢</b>, "
-                     f"чаще {top_zone[0]} ({pct(top_zone[1], len(prices))})")
-            zline = " ".join(f"{z}:{c}" for z,c in zones.items() if c)
-            L.append(f"   {zline}")
+    L.append(f"💰 Реализованный P&L: <b>${fmt_money(realized)}</b>")
+    if invested > 0:
+        L.append(f"   ROI: {realized/invested*100:+.0f}% (вложено ${invested:,.0f})")
+    if nc:
+        L.append(f"📈 Винрейт: <b>{len(wins)}/{nc}</b> ({pct(len(wins), nc)}) по закрытым")
+    L.append(f"   ✅ {len(wins)} побед / ❌ {len(losses)} проигрышей")
 
-        # ── YES/NO ──
-        yes = sum(1 for p in positions if p.get("outcome") == "Yes")
-        no = n - yes
+    # Активные позиции — отдельно, НЕ в итог
+    if active:
+        na = len(active)
+        unreal = sum(float(p.get("cashPnl", 0) or 0) for p in active)
+        cur_val = sum(float(p.get("currentValue", 0) or 0) for p in active)
+        L.append(f"🎲 В игре: {na} позиций, ${cur_val:,.0f} "
+                 f"(бумажный {fmt_money(unreal)})")
+    L.append("")
+
+    # ── Зоны входа (по закрытым — полная картина) ──
+    prices = [float(p.get("avgPrice", 0) or 0) for p in closed if p.get("avgPrice")]
+    if prices:
+        med = sorted(prices)[len(prices)//2]
+        zones = {"1-5¢":0,"5-15¢":0,"15-35¢":0,"35-50¢":0,"50-65¢":0,"65¢+":0}
+        for pr in prices:
+            if pr < 0.05: zones["1-5¢"] += 1
+            elif pr < 0.15: zones["5-15¢"] += 1
+            elif pr < 0.35: zones["15-35¢"] += 1
+            elif pr < 0.50: zones["35-50¢"] += 1
+            elif pr < 0.65: zones["50-65¢"] += 1
+            else: zones["65¢+"] += 1
+        top_zone = max(zones.items(), key=lambda kv: kv[1])
+        L.append(f"🎯 Вход: медиана <b>{med*100:.0f}¢</b>, "
+                 f"чаще {top_zone[0]} ({pct(top_zone[1], len(prices))})")
+        zline = " ".join(f"{z}:{c}" for z,c in zones.items() if c)
+        L.append(f"   {zline}")
+
+        # Винрейт ПО ЗОНАМ — где трейдер реально зарабатывает
+        zone_stats = {}
+        for p in closed:
+            pr = float(p.get("avgPrice",0) or 0)
+            rp = float(p.get("realizedPnl",0) or 0)
+            if pr < 0.15: z="дешёвые<15¢"
+            elif pr < 0.50: z="средние15-50¢"
+            else: z="дорогие50¢+"
+            if z not in zone_stats: zone_stats[z]={"n":0,"w":0,"pnl":0.0}
+            zone_stats[z]["n"]+=1
+            zone_stats[z]["pnl"]+=rp
+            if rp>0: zone_stats[z]["w"]+=1
+        L.append("   P&L по зонам входа:")
+        for z in ["дешёвые<15¢","средние15-50¢","дорогие50¢+"]:
+            if z in zone_stats:
+                s=zone_stats[z]
+                L.append(f"     {z}: {s['w']}/{s['n']} ${fmt_money(s['pnl'])}")
+
+    # ── YES/NO (по закрытым) ──
+    yes = sum(1 for p in closed if p.get("outcome") == "Yes")
+    no = nc - yes
+    if nc:
         side = "покупает YES" if yes > no*1.5 else ("покупает NO" if no > yes*1.5 else "YES и NO поровну")
         L.append(f"⚖️ {side}: YES {yes} / NO {no}")
 
-        # ── Размер ставки ──
-        sizes = [float(p.get("initialValue", 0) or 0) for p in positions if p.get("initialValue")]
-        if sizes:
-            med_s = sorted(sizes)[len(sizes)//2]
-            L.append(f"📏 Ставка: медиана <b>${med_s:.0f}</b> "
-                     f"(${min(sizes):.0f}–${max(sizes):.0f})")
+    # ── Размер ставки ──
+    sizes = [float(p.get("totalBought", 0) or 0) for p in closed if p.get("totalBought")]
+    if sizes:
+        med_s = sorted(sizes)[len(sizes)//2]
+        L.append(f"📏 Ставка: медиана <b>${med_s:.0f}</b> "
+                 f"(${min(sizes):.0f}–${max(sizes):.0f})")
+    L.append("")
 
-        # ── Резолюция ──
-        up = sum(1 for p in positions if float(p.get("curPrice", 0) or 0) >= 0.95)
-        dn = sum(1 for p in positions if float(p.get("curPrice", 1) or 1) <= 0.05)
-        L.append(f"🏁 Дошло до конца: {up} 🟢 / {dn} 🔴, в игре {n-up-dn}")
-        L.append("")
-
-    # ── Паттерн сделок: держит или торгует ──
+    # ── Держит или торгует ──
     if trades:
         buys = sum(1 for t in trades if t.get("side") == "BUY")
         sells = sum(1 for t in trades if t.get("side") == "SELL")
         ts = [t.get("timestamp", 0) for t in trades if t.get("timestamp")]
-        L.append(f"🔄 Действий: {len(trades)} (BUY {buys} / SELL {sells})")
+        L.append(f"🔄 Действий загружено: {len(trades)} (BUY {buys} / SELL {sells})")
         if sells < buys * 0.3:
             L.append("   → ДЕРЖИТ до резолюции (почти не продаёт)")
         elif sells > buys * 0.7:
@@ -174,26 +200,26 @@ def build_analysis(positions, trades):
         if ts:
             span = (max(ts)-min(ts))/86400
             if span >= 1:
-                L.append(f"   {span:.0f} дней, {len(trades)/span:.1f} сделок/день")
+                L.append(f"   {span:.0f} дней наблюдения")
 
     return "\n".join(L), is_weather_trader
 
 
-def build_cities(positions):
-    """Разбор по городам (для погодных трейдеров)."""
+def build_cities(closed):
+    """Разбор по городам (для погодных трейдеров) — по закрытым позициям."""
     by_city = defaultdict(lambda: {"n":0, "pnl":0.0, "win":0})
-    for p in positions:
+    for p in closed:
         if not is_weather(p.get("title")):
             continue
         c = city_of(p.get("title"))
         d = by_city[c]; d["n"] += 1
-        cp = float(p.get("cashPnl", 0) or 0)
-        d["pnl"] += cp
-        if cp > 0: d["win"] += 1
+        rp = float(p.get("realizedPnl", 0) or 0)
+        d["pnl"] += rp
+        if rp > 0: d["win"] += 1
     if not by_city:
-        return "Нет погодных позиций для разбора по городам."
+        return "Нет закрытых погодных позиций для разбора по городам."
     items = sorted(by_city.items(), key=lambda kv: -kv[1]["pnl"])
-    L = ["🏙 <b>По городам</b> (P&L):", ""]
+    L = ["🏙 <b>По городам</b> (реализованный P&L):", ""]
     for c, d in items[:25]:
         if d["n"] < 1: continue
         mark = "🟢" if d["pnl"] > 0 else "🔴"
@@ -225,20 +251,30 @@ def analysis_keyboard(is_weather_trader):
 # ─── Обработчик: разбор кошелька ──────────────────────────────────────────────
 
 async def run_analysis(message, wallet):
-    msg = await message.answer(f"⏳ Качаю историю {wallet[:10]}…\nЭто займёт минуту.")
+    msg = await message.answer(f"⏳ Качаю историю {wallet[:10]}…\nЭто займёт минуту-две.")
     async with aiohttp.ClientSession() as session:
-        positions = await fetch_all(session, "positions",
-                                    {"user": wallet, "sizeThreshold": 0})
-        await msg.edit_text(f"⏳ Позиций: {len(positions)}. Качаю сделки…")
-        trades = await fetch_all(session, "trades", {"user": wallet})
+        # Закрытые позиции (limit 50!) — для P&L и винрейта
+        closed = await fetch_all(session, "closed-positions",
+                                 {"user": wallet, "sortBy": "TIMESTAMP"},
+                                 page_size=50, max_pages=400)
+        await msg.edit_text(f"⏳ Закрытых позиций: {len(closed)}. Качаю активные…")
+        # Активные позиции (limit 500) — для 'в игре'
+        active = await fetch_all(session, "positions",
+                                 {"user": wallet, "sizeThreshold": 0},
+                                 page_size=500, max_pages=40)
+        await msg.edit_text(f"⏳ Закрытых {len(closed)}, активных {len(active)}. "
+                            f"Качаю сделки…")
+        # Сделки (для паттерна держит/торгует)
+        trades = await fetch_all(session, "trades", {"user": wallet},
+                                 page_size=500, max_pages=40)
 
-    if not positions and not trades:
+    if not closed and not active and not trades:
         await msg.edit_text("❌ Ничего не нашёл. Проверь адрес кошелька.")
         return
 
-    text, is_w = build_analysis(positions, trades)
+    text, is_w = build_analysis(closed, active, trades)
     last_analysis[message.chat.id] = {
-        "positions": positions, "trades": trades, "wallet": wallet}
+        "closed": closed, "active": active, "trades": trades, "wallet": wallet}
     await msg.delete()
     await message.answer(text, parse_mode="HTML",
                          reply_markup=analysis_keyboard(is_w),
@@ -294,7 +330,7 @@ async def cb_cities(callback: types.CallbackQuery):
     if not data:
         await callback.message.answer("Сначала пришли кошелёк.")
         return
-    await callback.message.answer(build_cities(data["positions"]),
+    await callback.message.answer(build_cities(data["closed"]),
                                   parse_mode="HTML", disable_web_page_preview=True)
 
 

@@ -1,29 +1,20 @@
 import asyncio
 import logging
 import os
-import json
 import re
-from datetime import datetime, timezone
+from collections import defaultdict
 
 import aiohttp
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import (InlineKeyboardMarkup, InlineKeyboardButton,
+                           ReplyKeyboardMarkup, KeyboardButton)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "120"))
-RESULT_CHECK_INTERVAL = 120
-PRICE_CHECK_INTERVAL = 300
-PRICE_ALERT_THRESHOLD = 0.07
-HLTV_UPDATE_INTERVAL = 3600
-PAPER_BET_SIZE = 5.0
-PAPER_BANK = 100.0
-
-# Файлы для хранения данных между рестартами
-DATA_DIR = os.getenv("DATA_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
-PREDICTIONS_FILE = os.path.join(DATA_DIR, "predictions.json")
-SUBSCRIBERS_FILE = os.path.join(DATA_DIR, "subscribers.json")
-KNOWN_MARKETS_FILE = os.path.join(DATA_DIR, "known_markets.json")
+DATA_API = "https://data-api.polymarket.com"
+PAGE = 500          # лимит API на страницу
+MAX_PAGES = 40      # потолок пагинации (40×500 = 20000 записей)
+PAUSE = 0.25        # пауза между страницами
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -31,996 +22,291 @@ log = logging.getLogger(__name__)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-subscribers = set()
-known_market_ids = set()
-is_first_run = True
-hltv_ranking = {}
-hltv_last_updated = None
-predictions = {}
+# Кэш последнего разбора по чату (для кнопок углубления)
+last_analysis: dict = {}
 
-GAMMA_API = "https://gamma-api.polymarket.com"
-
-CS2_TAG_SLUGS = ["counter-strike", "cs2", "esports"]
-CS2_IDENTIFIERS = ["counter-strike", "cs2", "csgo", "cs:go"]
-
-EXCLUDE_WORDS = [
-    "map 1", "map 2", "map 3", "map 4", "map 5",
-    "first map", "pistol", "knife",
-    "games total", "o/u", "over/under",
-    "first blood", "first kill", "ace", "bomb",
-    "most kills", "handicap",
-    "signs for", "signs with",
-    "will valve", "map pool", "which maps",
-    "what will", "how many",
-]
-
-FALLBACK_RANKING = {
-    "vitality": 1, "natus vincere": 2, "navi": 2,
-    "faze": 3, "faze clan": 3, "g2": 4, "g2 esports": 4,
-    "spirit": 5, "team spirit": 5, "liquid": 6, "team liquid": 6,
-    "mouz": 7, "heroic": 8, "astralis": 9, "nip": 10,
-    "complexity": 11, "ence": 12, "cloud9": 13, "big": 14,
-    "eternal fire": 15, "fnatic": 16, "pain": 17, "3dmax": 18,
-    "mibr": 19, "virtus.pro": 21, "flyquest": 22, "monte": 23,
-    "saw": 24, "apeks": 25, "b8": 26, "betboom": 27,
-    "betboom team": 27, "parivision": 28, "aurora": 29,
-    "100 thieves": 30, "falcons": 31, "team falcons": 31,
-    "furia": 32,
-}
+WALLET_RE = re.compile(r"0x[a-fA-F0-9]{40}")
 
 
-# ─── Persistence ──────────────────────────────────────────────────────────────
+# ─── Загрузка данных с пагинацией ─────────────────────────────────────────────
 
-def ensure_data_dir():
-    os.makedirs(DATA_DIR, exist_ok=True)
-
-
-def save_predictions():
-    try:
-        ensure_data_dir()
-        # Конвертируем int ключи в строки для JSON
-        data = {str(k): v for k, v in predictions.items()}
-        with open(PREDICTIONS_FILE, "w") as f:
-            json.dump(data, f)
-    except Exception as e:
-        log.warning("save_predictions failed: %s", e)
-
-
-def load_predictions():
-    global predictions
-    try:
-        if os.path.exists(PREDICTIONS_FILE):
-            with open(PREDICTIONS_FILE) as f:
-                data = json.load(f)
-            predictions = {int(k): v for k, v in data.items()}
-            total = sum(len(v) for v in predictions.values())
-            log.info("Loaded predictions: %d users, %d total", len(predictions), total)
-    except Exception as e:
-        log.warning("load_predictions failed: %s", e)
-        predictions = {}
-
-
-def save_subscribers():
-    try:
-        ensure_data_dir()
-        with open(SUBSCRIBERS_FILE, "w") as f:
-            json.dump(list(subscribers), f)
-    except Exception as e:
-        log.warning("save_subscribers failed: %s", e)
+async def fetch_all(session, endpoint, params):
+    """Качает все записи через offset-пагинацию."""
+    out = []
+    offset = 0
+    for _ in range(MAX_PAGES):
+        p = dict(params)
+        p["limit"] = PAGE
+        p["offset"] = offset
+        try:
+            async with session.get(f"{DATA_API}/{endpoint}", params=p,
+                                   timeout=aiohttp.ClientTimeout(total=30)) as r:
+                if r.status != 200:
+                    log.warning("%s status %s", endpoint, r.status)
+                    break
+                batch = await r.json()
+        except Exception as e:
+            log.warning("fetch %s offset=%s: %s", endpoint, offset, e)
+            break
+        if not batch:
+            break
+        out.extend(batch)
+        if len(batch) < PAGE:
+            break
+        offset += PAGE
+        await asyncio.sleep(PAUSE)
+    return out
 
 
-def load_subscribers():
-    global subscribers
-    try:
-        if os.path.exists(SUBSCRIBERS_FILE):
-            with open(SUBSCRIBERS_FILE) as f:
-                subscribers = set(json.load(f))
-            log.info("Loaded subscribers: %d", len(subscribers))
-    except Exception as e:
-        log.warning("load_subscribers failed: %s", e)
-        subscribers = set()
+# ─── Помощники анализа ────────────────────────────────────────────────────────
+
+def is_weather(title):
+    t = (title or "").lower()
+    return any(w in t for w in
+               ["temperature", "°c", "°f", "hottest", "warmest", "rain",
+                "snow", "weather", "degrees", "highest temp", "lowest temp"])
 
 
-def save_known_markets():
-    try:
-        ensure_data_dir()
-        with open(KNOWN_MARKETS_FILE, "w") as f:
-            json.dump(list(known_market_ids), f)
-    except Exception as e:
-        log.warning("save_known_markets failed: %s", e)
-
-
-def load_known_markets():
-    global known_market_ids
-    try:
-        if os.path.exists(KNOWN_MARKETS_FILE):
-            with open(KNOWN_MARKETS_FILE) as f:
-                known_market_ids = set(json.load(f))
-            log.info("Loaded known markets: %d", len(known_market_ids))
-    except Exception as e:
-        log.warning("load_known_markets failed: %s", e)
-        known_market_ids = set()
-
-
-# ─── Helpers ──────────────────────────────────────────────────────────────────
-
-def is_cs2_event(event):
-    text = (event.get("title", "") + " " + event.get("slug", "")).lower()
-    return any(w in text for w in CS2_IDENTIFIERS)
-
-
-def is_resolved(market):
-    try:
-        prices = market.get("outcomePrices", "[]")
-        if isinstance(prices, str):
-            prices = json.loads(prices)
-        if prices and len(prices) >= 2:
-            p0 = round(float(prices[0]), 4)
-            p1 = round(float(prices[1]), 4)
-            if (p0 == 0.0 and p1 == 1.0) or (p0 == 1.0 and p1 == 0.0):
-                return True
-    except Exception:
-        pass
-    return False
-
-
-def is_match_market(market):
-    question = market.get("question", "").lower()
-    if " vs " not in question and " vs. " not in question:
-        return False
-    if any(w in question for w in EXCLUDE_WORDS):
-        return False
-    if market.get("closed"):
-        return False
-    if is_resolved(market):
-        return False
-    return True
-
-
-def get_prices(market):
-    try:
-        prices = market.get("outcomePrices", "[]")
-        if isinstance(prices, str):
-            prices = json.loads(prices)
-        return [float(p) for p in prices[:2]]
-    except Exception:
-        return [0.5, 0.5]
-
-
-def get_price_str(market, idx):
-    try:
-        return str(round(get_prices(market)[idx] * 100)) + "c"
-    except Exception:
-        return "?"
-
-
-def format_volume(market):
-    try:
-        v = float(market.get("volume", 0) or 0)
-        if v >= 1000000:
-            return "$" + str(round(v / 1000000, 1)) + "M"
-        if v >= 1000:
-            return "$" + str(round(v / 1000, 1)) + "K"
-        return "$" + str(round(v))
-    except Exception:
-        return "$?"
-
-
-def market_url(market):
-    slug = market.get("slug") or market.get("id", "")
-    return "https://polymarket.com/event/" + str(slug)
-
-
-ACADEMY_SUFFIXES = ["junior", "academy", "young", "youth", "rookies", " ii", "alter", " 2", "young blood"]
-
-def is_academy_team(name):
-    """Академии и молодёжки не получают рейтинг основной команды."""
-    n = name.strip().lower()
-    return any(s in n for s in ACADEMY_SUFFIXES)
-
-def get_team_rank(name):
-    if not name:
-        return ""
-    # Академии не получают рейтинг основной команды
-    if is_academy_team(name):
-        return ""
-    ranking = hltv_ranking if hltv_ranking else FALLBACK_RANKING
-    n = name.strip().lower()
-    # Точное совпадение
-    if n in ranking:
-        return "#" + str(ranking[n])
-    # Частичное — только если совпадение достаточно точное (длина ключа >= 4)
-    for key, rank in ranking.items():
-        if len(key) >= 4 and (key == n or n == key):
-            return "#" + str(rank)
-        # Ключ входит в имя — только если имя не длиннее ключа более чем на 3 символа
-        if key in n and len(n) - len(key) <= 3:
-            return "#" + str(rank)
-        if n in key and len(key) - len(n) <= 3:
-            return "#" + str(rank)
-    return ""
-
-
-def extract_teams(market):
-    try:
-        raw = market.get("outcomes", "[]")
-        outcomes = json.loads(raw) if isinstance(raw, str) else raw
-        teams = [str(o).strip() for o in outcomes
-                 if str(o).strip().lower() not in (
-                     "yes", "no", "draw", "other", "neither", "over", "under")]
-        if teams:
-            return teams[:2]
-    except Exception:
-        pass
-    return []
-
-
-def matchup_line(market):
-    teams = extract_teams(market)
-    p0 = get_price_str(market, 0)
-    p1 = get_price_str(market, 1)
-    if len(teams) >= 2:
-        r0 = get_team_rank(teams[0])
-        r1 = get_team_rank(teams[1])
-        t0 = teams[0] + (" " + r0 if r0 else "") + " " + p0
-        t1 = teams[1] + (" " + r1 if r1 else "") + " " + p1
-        return t0 + " vs " + t1
-    return "YES " + p0 + " / NO " + p1
-
-
-def prediction_keyboard(market):
-    mid = str(market.get("id", ""))
-    teams = extract_teams(market)
-    if len(teams) >= 2:
-        return InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🟢 " + teams[0][:22],
-                    callback_data="pick:" + mid + ":0"
-                ),
-                InlineKeyboardButton(
-                    text="🟢 " + teams[1][:22],
-                    callback_data="pick:" + mid + ":1"
-                ),
-            ],
-            [InlineKeyboardButton(text="Open on Polymarket", url=market_url(market))]
-        ])
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="Open on Polymarket", url=market_url(market))
-    ]])
-
-
-def format_match_time(market):
-    """Время окончания/дедлайн матча из endDate."""
-    for field in ("endDate", "endDateIso", "startDate"):
-        raw = market.get(field, "")
-        if raw:
-            try:
-                dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-                return dt.strftime("%d.%m.%Y %H:%M UTC")
-            except Exception:
-                pass
+def city_of(title):
+    """Достаёт город из заголовка погодного рынка."""
+    t = title or ""
+    m = re.search(r"\bin ([A-Z][a-zA-Z .'-]+?)(?: be| on| this| today| tomorrow|$)", t)
+    if m:
+        return m.group(1).strip()[:20]
     return "?"
 
 
-def new_market_text(market):
-    question = market.get("question", "?")
-    volume = format_volume(market)
-    match_time = format_match_time(market)
-    line = matchup_line(market)
-    return (
-        "<b>🎮 New CS2 match on Polymarket!</b>\n"
-        + "🕐 " + match_time + "\n\n"
-        + question + "\n\n"
-        + line + "\n\n"
-        + "Volume: " + volume + "\n\n"
-        + "📊 Make your prediction:"
-    )
+def fmt_money(x):
+    s = f"{x:+,.2f}"
+    return s
 
 
-PAGE_SIZE = 15
-
-# Кэш списка матчей для пагинации (chat_id -> list of markets)
-list_cache: dict = {}
+def pct(part, whole):
+    return f"{part/whole*100:.0f}%" if whole else "0%"
 
 
-def list_page_text(markets, offset=0):
-    chunk = markets[offset:offset + PAGE_SIZE]
-    lines = ["<b>🎮 CS2 matches on Polymarket:</b>\n"]
-    for m in chunk:
-        q = m.get("question", "?")[:60]
-        url = market_url(m)
-        match_time = format_match_time(m)
-        line = matchup_line(m)
-        lines.append(
-            "- <a href=\"" + url + "\">" + q + "</a>\n"
-            "  🕐 " + match_time + "\n"
-            "  " + line
-        )
-    return "\n\n".join(lines)
+# ─── Главный разбор ───────────────────────────────────────────────────────────
+
+def build_analysis(positions, trades):
+    """Собирает текстовый разбор стратегии трейдера."""
+    name = "?"
+    for t in trades:
+        if t.get("name"):
+            name = t["name"]; break
+    if name == "?":
+        for p in positions:
+            if p.get("name"):
+                name = p["name"]; break
+
+    weather_share = 0
+    if positions:
+        w = sum(1 for p in positions if is_weather(p.get("title")))
+        weather_share = w / len(positions)
+    is_weather_trader = weather_share >= 0.5
+
+    L = [f"📊 <b>{name}</b>"]
+    if is_weather_trader:
+        L.append(f"🌤 Погодный трейдер ({weather_share*100:.0f}% позиций)")
+    L.append("")
+
+    # ── P&L и винрейт по позициям ──
+    if positions:
+        n = len(positions)
+        cash = sum(float(p.get("cashPnl", 0) or 0) for p in positions)
+        realized = sum(float(p.get("realizedPnl", 0) or 0) for p in positions)
+        initial = sum(float(p.get("initialValue", 0) or 0) for p in positions)
+        wins = [p for p in positions if float(p.get("cashPnl", 0) or 0) > 0]
+        roi = f" ({cash/initial*100:+.0f}% ROI)" if initial > 0 else ""
+        L.append(f"💰 P&L: <b>${fmt_money(cash)}</b>{roi}")
+        if abs(realized) > 0.01:
+            L.append(f"   реализовано: ${fmt_money(realized)}")
+        L.append(f"📈 Винрейт: <b>{len(wins)}/{n}</b> ({pct(len(wins), n)})")
+        L.append(f"💵 Вложено: ${initial:,.0f}")
+        L.append("")
+
+        # ── Зоны входа ──
+        prices = [float(p.get("avgPrice", 0) or 0) for p in positions if p.get("avgPrice")]
+        if prices:
+            med = sorted(prices)[len(prices)//2]
+            zones = {"1-5¢":0,"5-15¢":0,"15-35¢":0,"35-50¢":0,"50-65¢":0,"65¢+":0}
+            for pr in prices:
+                if pr < 0.05: zones["1-5¢"] += 1
+                elif pr < 0.15: zones["5-15¢"] += 1
+                elif pr < 0.35: zones["15-35¢"] += 1
+                elif pr < 0.50: zones["35-50¢"] += 1
+                elif pr < 0.65: zones["50-65¢"] += 1
+                else: zones["65¢+"] += 1
+            top_zone = max(zones.items(), key=lambda kv: kv[1])
+            L.append(f"🎯 Вход: медиана <b>{med*100:.0f}¢</b>, "
+                     f"чаще {top_zone[0]} ({pct(top_zone[1], len(prices))})")
+            zline = " ".join(f"{z}:{c}" for z,c in zones.items() if c)
+            L.append(f"   {zline}")
+
+        # ── YES/NO ──
+        yes = sum(1 for p in positions if p.get("outcome") == "Yes")
+        no = n - yes
+        side = "покупает YES" if yes > no*1.5 else ("покупает NO" if no > yes*1.5 else "YES и NO поровну")
+        L.append(f"⚖️ {side}: YES {yes} / NO {no}")
+
+        # ── Размер ставки ──
+        sizes = [float(p.get("initialValue", 0) or 0) for p in positions if p.get("initialValue")]
+        if sizes:
+            med_s = sorted(sizes)[len(sizes)//2]
+            L.append(f"📏 Ставка: медиана <b>${med_s:.0f}</b> "
+                     f"(${min(sizes):.0f}–${max(sizes):.0f})")
+
+        # ── Резолюция ──
+        up = sum(1 for p in positions if float(p.get("curPrice", 0) or 0) >= 0.95)
+        dn = sum(1 for p in positions if float(p.get("curPrice", 1) or 1) <= 0.05)
+        L.append(f"🏁 Дошло до конца: {up} 🟢 / {dn} 🔴, в игре {n-up-dn}")
+        L.append("")
+
+    # ── Паттерн сделок: держит или торгует ──
+    if trades:
+        buys = sum(1 for t in trades if t.get("side") == "BUY")
+        sells = sum(1 for t in trades if t.get("side") == "SELL")
+        ts = [t.get("timestamp", 0) for t in trades if t.get("timestamp")]
+        L.append(f"🔄 Действий: {len(trades)} (BUY {buys} / SELL {sells})")
+        if sells < buys * 0.3:
+            L.append("   → ДЕРЖИТ до резолюции (почти не продаёт)")
+        elif sells > buys * 0.7:
+            L.append("   → активно торгует выходами")
+        if ts:
+            span = (max(ts)-min(ts))/86400
+            if span >= 1:
+                L.append(f"   {span:.0f} дней, {len(trades)/span:.1f} сделок/день")
+
+    return "\n".join(L), is_weather_trader
 
 
-def list_page_keyboard(total, offset=0):
-    """Кнопка 'Show more' если есть ещё матчи."""
-    shown = min(offset + PAGE_SIZE, total)
-    remaining = total - shown
-    if remaining <= 0:
-        return None
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(
-            text="📋 Show " + str(remaining) + " more",
-            callback_data="list_more:" + str(shown)
-        )
-    ]])
+def build_cities(positions):
+    """Разбор по городам (для погодных трейдеров)."""
+    by_city = defaultdict(lambda: {"n":0, "pnl":0.0, "win":0})
+    for p in positions:
+        if not is_weather(p.get("title")):
+            continue
+        c = city_of(p.get("title"))
+        d = by_city[c]; d["n"] += 1
+        cp = float(p.get("cashPnl", 0) or 0)
+        d["pnl"] += cp
+        if cp > 0: d["win"] += 1
+    if not by_city:
+        return "Нет погодных позиций для разбора по городам."
+    items = sorted(by_city.items(), key=lambda kv: -kv[1]["pnl"])
+    L = ["🏙 <b>По городам</b> (P&L):", ""]
+    for c, d in items[:25]:
+        if d["n"] < 1: continue
+        mark = "🟢" if d["pnl"] > 0 else "🔴"
+        L.append(f"{mark} {c}: {d['win']}/{d['n']} ${fmt_money(d['pnl'])}")
+    return "\n".join(L)
 
 
-# ─── HLTV ─────────────────────────────────────────────────────────────────────
-
-async def fetch_hltv(session):
-    ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    try:
-        async with session.get(
-            "https://www.hltv.org/ranking/teams",
-            headers={"User-Agent": ua, "Accept-Language": "en-US,en;q=0.9"},
-            timeout=aiohttp.ClientTimeout(total=15),
-        ) as r:
-            if r.status != 200:
-                return FALLBACK_RANKING.copy()
-            html = await r.text()
-            ranking = {}
-            blocks = re.findall(r'class="position">#(\d+).*?class="name">(.*?)<', html, re.DOTALL)
-            for rank_str, name_raw in blocks:
-                name = re.sub(r"<[^>]+>", "", name_raw).strip().lower()
-                try:
-                    ranking[name] = int(rank_str)
-                except ValueError:
-                    pass
-            return ranking if ranking else FALLBACK_RANKING.copy()
-    except Exception:
-        return FALLBACK_RANKING.copy()
+def build_recent(trades, limit=15):
+    """Последние сделки."""
+    L = ["🕐 <b>Последние сделки</b>:", ""]
+    for t in trades[:limit]:
+        side = t.get("side", "?")
+        price = float(t.get("price", 0) or 0)
+        title = (t.get("title", "?") or "?")[:35]
+        out = t.get("outcome", "")
+        emoji = "🟢" if side == "BUY" else "🔴"
+        L.append(f"{emoji} {side} {out} @ {price*100:.0f}¢ — {title}")
+    return "\n".join(L)
 
 
-async def refresh_hltv(session):
-    global hltv_ranking, hltv_last_updated
-    now = datetime.now(timezone.utc)
-    if (not hltv_ranking or hltv_last_updated is None or
-            (now - hltv_last_updated).total_seconds() > HLTV_UPDATE_INTERVAL):
-        hltv_ranking = await fetch_hltv(session)
-        hltv_last_updated = now
-        log.info("HLTV updated: %d teams", len(hltv_ranking))
+def analysis_keyboard(is_weather_trader):
+    rows = []
+    if is_weather_trader:
+        rows.append([InlineKeyboardButton(text="🏙 По городам", callback_data="a:cities")])
+    rows.append([InlineKeyboardButton(text="🕐 Последние сделки", callback_data="a:recent")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-# ─── Markets ──────────────────────────────────────────────────────────────────
+# ─── Обработчик: разбор кошелька ──────────────────────────────────────────────
 
-async def fetch_markets(session):
-    all_markets = []
-    seen_event_ids = set()
-
-    for tag_slug in CS2_TAG_SLUGS:
-        offset = 0
-        limit = 100
-        while True:
-            try:
-                params = {
-                    "tag_slug": tag_slug,
-                    "closed": "false",
-                    "limit": str(limit),
-                    "offset": str(offset),
-                    "order": "startDate",
-                    "ascending": "false"
-                }
-                async with session.get(
-                    GAMMA_API + "/events", params=params,
-                    timeout=aiohttp.ClientTimeout(total=20),
-                ) as r:
-                    if r.status != 200:
-                        break
-                    data = await r.json()
-                    events = data if isinstance(data, list) else data.get("events", data.get("data", []))
-                    if not events:
-                        break
-                    for event in events:
-                        eid = event.get("id")
-                        if eid in seen_event_ids:
-                            continue
-                        if tag_slug == "esports" and not is_cs2_event(event):
-                            continue
-                        seen_event_ids.add(eid)
-                        for m in event.get("markets", []):
-                            all_markets.append(m)
-                    if len(events) < limit:
-                        break
-                    offset += limit
-            except Exception as e:
-                log.warning("fetch tag=%s failed: %s", tag_slug, e)
-                break
-
-    seen = set()
-    unique = []
-    for m in all_markets:
-        mid = m.get("id")
-        if mid and mid not in seen:
-            seen.add(mid)
-            if is_match_market(m):
-                unique.append(m)
-
-    log.info("Markets: %d match markets", len(unique))
-    return unique
-
-
-async def fetch_market_by_id(session, market_id):
-    try:
-        async with session.get(
-            GAMMA_API + "/markets/" + str(market_id),
-            timeout=aiohttp.ClientTimeout(total=15),
-        ) as r:
-            if r.status == 200:
-                return await r.json()
-    except Exception as e:
-        log.warning("fetch_market_by_id %s: %s", market_id, e)
-    return None
-
-
-# ─── Price tracking ───────────────────────────────────────────────────────────
-
-async def check_price_changes(session):
-    for chat_id, user_preds in list(predictions.items()):
-        for market_id, pred in list(user_preds.items()):
-            if pred.get("outcome"):
-                continue
-
-            market = await fetch_market_by_id(session, market_id)
-            if not market:
-                continue
-
-            prices = get_prices(market)
-            chosen_idx = pred["chosen_idx"]
-            if chosen_idx >= len(prices):
-                continue
-
-            current_price = prices[chosen_idx]
-            last_price = pred.get("last_price", pred["entry_price"])
-            entry_price = pred["entry_price"]
-            change = current_price - last_price
-            change_from_entry = current_price - entry_price
-
-            if abs(change) >= PRICE_ALERT_THRESHOLD:
-                direction = "📈" if change > 0 else "📉"
-                direction_word = "UP" if change > 0 else "DOWN"
-                text = (
-                    direction + " <b>Price moved " + direction_word + "!</b>\n\n"
-                    + pred["question"] + "\n\n"
-                    + "Your pick: <b>" + pred["chosen_team"] + "</b>\n"
-                    + "Entry: " + str(round(entry_price * 100)) + "c\n"
-                    + "Previous: " + str(round(last_price * 100)) + "c\n"
-                    + "Now: <b>" + str(round(current_price * 100)) + "c</b>\n"
-                    + "Change: " + ("+" if change_from_entry >= 0 else "") + str(round(change_from_entry * 100)) + "c from entry\n\n"
-                    + "<a href=\"" + pred["market_url"] + "\">Open market</a>"
-                )
-                try:
-                    await bot.send_message(chat_id, text, parse_mode="HTML",
-                                           disable_web_page_preview=True)
-                except Exception as e:
-                    log.warning("price alert error %s: %s", chat_id, e)
-
-                pred["last_price"] = current_price
-                save_predictions()
-
-
-# ─── Result checking ──────────────────────────────────────────────────────────
-
-def get_winner_idx(market):
-    """Победитель определяется по closed=True + цена >= 0.95."""
-    if not market.get("closed"):
-        return None
-    try:
-        prices = market.get("outcomePrices", "[]")
-        if isinstance(prices, str):
-            prices = json.loads(prices)
-        if prices and len(prices) >= 2:
-            p0 = float(prices[0])
-            p1 = float(prices[1])
-            if p0 >= 0.95 and p1 <= 0.05:
-                return 0
-            if p1 >= 0.95 and p0 <= 0.05:
-                return 1
-    except Exception:
-        pass
-    return None
-
-
-async def check_predictions(session):
-    changed = False
-    for chat_id, user_preds in predictions.items():
-        for market_id, pred in list(user_preds.items()):
-            if pred.get("outcome"):
-                continue
-
-            market = await fetch_market_by_id(session, market_id)
-            if not market:
-                continue
-
-            winner_idx = get_winner_idx(market)
-            if winner_idx is None:
-                continue
-
-            chosen_idx = pred["chosen_idx"]
-            is_win = (chosen_idx == winner_idx)
-            pred["outcome"] = "win" if is_win else "loss"
-            changed = True
-
-            entry_price = pred["entry_price"]
-            pnl = round(PAPER_BET_SIZE * (1.0 / entry_price - 1), 2) if is_win else -PAPER_BET_SIZE
-
-            teams = extract_teams(market)
-            winner_name = teams[winner_idx] if winner_idx < len(teams) else "Unknown"
-
-            result_text = (
-                "<b>" + ("✅ Correct!" if is_win else "❌ Wrong!") + "</b>\n\n"
-                + pred["question"] + "\n\n"
-                + "Your pick: <b>" + pred["chosen_team"] + "</b>\n"
-                + "Winner: <b>" + winner_name + "</b>\n"
-                + "Entry: " + str(round(entry_price * 100)) + "c\n"
-                + "Paper P&L: <b>" + ("+" if pnl >= 0 else "") + str(pnl) + "$</b>\n\n"
-                + "<a href=\"" + pred["market_url"] + "\">View market</a>"
-            )
-            try:
-                await bot.send_message(chat_id, result_text, parse_mode="HTML",
-                                       disable_web_page_preview=True)
-            except Exception as e:
-                log.warning("send result error %s: %s", chat_id, e)
-
-    if changed:
-        save_predictions()
-
-
-# ─── Stats ────────────────────────────────────────────────────────────────────
-
-def get_user_stats(chat_id):
-    user_preds = predictions.get(chat_id, {})
-    total = len(user_preds)
-    finished = [p for p in user_preds.values() if p.get("outcome")]
-    wins = sum(1 for p in finished if p["outcome"] == "win")
-    losses = len(finished) - wins
-    pending = total - len(finished)
-    win_rate = round(wins / len(finished) * 100) if finished else 0
-
-    total_pnl = 0.0
-    for p in finished:
-        if p["outcome"] == "win":
-            total_pnl += round(PAPER_BET_SIZE * (1.0 / p["entry_price"] - 1), 2)
-        else:
-            total_pnl -= PAPER_BET_SIZE
-
-    # Банк = стартовый - все сделанные ставки + возврат выигрышей
-    # Pending ставки уже "в игре" — вычитаем их из банка
-    spent = total * PAPER_BET_SIZE          # потрачено на все ставки
-    returned = 0.0                           # возвращено с завершённых
-    for p in finished:
-        if p["outcome"] == "win":
-            returned += PAPER_BET_SIZE * (1.0 / p["entry_price"])  # ставка + выигрыш
-        # loss — ничего не возвращается
-    current_bank = round(PAPER_BANK - spent + returned, 2)
-
-    return {
-        "total": total, "finished": len(finished),
-        "wins": wins, "losses": losses,
-        "pending": pending, "win_rate": win_rate,
-        "total_pnl": round(total_pnl, 2),
-        "current_bank": current_bank,
-        "preds": user_preds,
-    }
-
-
-# ─── Tracker ──────────────────────────────────────────────────────────────────
-
-async def tracker():
-    global is_first_run
+async def run_analysis(message, wallet):
+    msg = await message.answer(f"⏳ Качаю историю {wallet[:10]}…\nЭто займёт минуту.")
     async with aiohttp.ClientSession() as session:
-        await refresh_hltv(session)
-        result_counter = 0
-        price_counter = 0
-        while True:
-            try:
-                await refresh_hltv(session)
-                markets = await fetch_markets(session)
-                new_ones = []
-                for m in markets:
-                    mid = str(m.get("id", ""))
-                    if mid and mid not in known_market_ids:
-                        if not is_first_run:
-                            new_ones.append(m)
-                        known_market_ids.add(mid)
+        positions = await fetch_all(session, "positions",
+                                    {"user": wallet, "sizeThreshold": 0})
+        await msg.edit_text(f"⏳ Позиций: {len(positions)}. Качаю сделки…")
+        trades = await fetch_all(session, "trades", {"user": wallet})
 
-                if is_first_run:
-                    log.info("First run: %d markets", len(markets))
-                    is_first_run = False
-                else:
-                    log.info("Check: known=%d new=%d", len(known_market_ids), len(new_ones))
-                    if new_ones:
-                        save_known_markets()
+    if not positions and not trades:
+        await msg.edit_text("❌ Ничего не нашёл. Проверь адрес кошелька.")
+        return
 
-                for market in new_ones:
-                    text = new_market_text(market)
-                    kb = prediction_keyboard(market)
-                    for chat_id in list(subscribers):
-                        try:
-                            await bot.send_message(chat_id, text, parse_mode="HTML",
-                                                   reply_markup=kb,
-                                                   disable_web_page_preview=True)
-                        except Exception as e:
-                            log.warning("send error %s: %s", chat_id, e)
-                            if "blocked" in str(e).lower() or "not found" in str(e).lower():
-                                subscribers.discard(chat_id)
-                                save_subscribers()
+    text, is_w = build_analysis(positions, trades)
+    last_analysis[message.chat.id] = {
+        "positions": positions, "trades": trades, "wallet": wallet}
+    await msg.delete()
+    await message.answer(text, parse_mode="HTML",
+                         reply_markup=analysis_keyboard(is_w),
+                         disable_web_page_preview=True)
 
-                result_counter += CHECK_INTERVAL
-                if result_counter >= RESULT_CHECK_INTERVAL:
-                    await check_predictions(session)
-                    result_counter = 0
-
-                price_counter += CHECK_INTERVAL
-                if price_counter >= PRICE_CHECK_INTERVAL:
-                    await check_price_changes(session)
-                    price_counter = 0
-
-            except Exception as e:
-                log.error("tracker error: %s", e)
-            await asyncio.sleep(CHECK_INTERVAL)
-
-
-# ─── Handlers ─────────────────────────────────────────────────────────────────
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    subscribers.add(message.chat.id)
-    save_subscribers()
     kb = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🎮 Matches"), KeyboardButton(text="📈 My Stats")],
-            [KeyboardButton(text="📊 HLTV Top-30"), KeyboardButton(text="ℹ️ Status")],
-        ],
-        resize_keyboard=True,
-        persistent=True,
-    )
+        keyboard=[[KeyboardButton(text="ℹ️ Как пользоваться")]],
+        resize_keyboard=True, persistent=True)
     await message.answer(
-        "<b>🎮 CS2 Polymarket Tracker</b>\n\n"
-        "Tracks new CS2 matches and notifies you.\n"
-        "Tap a team on match notifications to make paper predictions.\n\n"
-        "/list - current CS2 matches\n"
-        "/mystats - prediction stats\n"
-        "/ranking - HLTV top 30\n"
-        "/status - bot status\n"
-        "/stop - unsubscribe",
-        parse_mode="HTML",
-        reply_markup=kb,
-    )
+        "<b>🔍 Trader Check</b>\n\n"
+        "Разбор любого трейдера Polymarket по кошельку.\n\n"
+        "Просто пришли адрес кошелька (0x…) — и я выдам:\n"
+        "• P&L, ROI, винрейт (с учётом проигравших)\n"
+        "• Зоны входа, YES/NO, размер ставок\n"
+        "• Держит до резолюции или торгует\n"
+        "• Для погодных — разбор по городам\n\n"
+        "Или команда: /check 0x…",
+        parse_mode="HTML", reply_markup=kb)
 
 
-# ─── Reply keyboard text handlers ─────────────────────────────────────────────
-
-@dp.message(lambda m: m.text == "🎮 Matches")
-async def btn_matches(message: types.Message):
-    await cmd_list(message)
-
-
-@dp.message(lambda m: m.text == "📈 My Stats")
-async def btn_mystats(message: types.Message):
-    await cmd_mystats(message)
-
-
-@dp.message(lambda m: m.text == "📊 HLTV Top-30")
-async def btn_ranking(message: types.Message):
-    await cmd_ranking(message)
-
-
-@dp.message(lambda m: m.text == "ℹ️ Status")
-async def btn_status(message: types.Message):
-    await cmd_status(message)
-
-
-@dp.message(Command("stop"))
-async def cmd_stop(message: types.Message):
-    subscribers.discard(message.chat.id)
-    save_subscribers()
-    await message.answer("Unsubscribed. /start to subscribe again.")
-
-
-# Кэш списка матчей для пагинации (chat_id -> list)
-list_cache: dict = {}
-
-
-def render_list_page(markets, offset=0):
-    PAGE = 15
-    chunk = markets[offset:offset + PAGE]
-    lines = ["<b>🎮 CS2 matches on Polymarket (" + str(len(markets)) + " total):</b>\n"]
-    for m in chunk:
-        q = m.get("question", "?")[:55]
-        url = market_url(m)
-        match_time = format_match_time(m)
-        line = matchup_line(m)
-        lines.append(
-            "- <a href=\"" + url + "\">" + q + "</a>\n"
-            "  🕐 " + match_time + "\n"
-            "  " + line
-        )
-    text = "\n\n".join(lines)
-    shown = offset + len(chunk)
-    remaining = len(markets) - shown
-    kb = None
-    if remaining > 0:
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(
-                text="📋 Show " + str(remaining) + " more",
-                callback_data="list_more:" + str(shown)
-            )
-        ]])
-    return text, kb
-
-
-async def send_list_page(message, markets, offset=0):
-    """Отправляет страницу матчей — каждый матч отдельным сообщением с кнопками."""
-    PAGE = 15
-    chunk = markets[offset:offset + PAGE]
-    for m in chunk:
-        question = m.get("question", "?")
-        match_time = format_match_time(m)
-        line = matchup_line(m)
-        text = "<b>" + question[:80] + "</b>\n🕐 " + match_time + "\n\n" + line
-        kb = prediction_keyboard(m)
-        await message.answer(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
-        await asyncio.sleep(0.2)
-    shown = offset + len(chunk)
-    remaining = len(markets) - shown
-    if remaining > 0:
-        kb_more = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(
-                text="📋 Show " + str(remaining) + " more",
-                callback_data="list_more:" + str(shown)
-            )
-        ]])
-        await message.answer(
-            "Showing " + str(shown) + " of " + str(len(markets)) + " matches.",
-            reply_markup=kb_more
-        )
-
-
-@dp.message(Command("list"))
-async def cmd_list(message: types.Message):
-    msg = await message.answer("Loading CS2 matches...")
-    async with aiohttp.ClientSession() as session:
-        await refresh_hltv(session)
-        markets = await fetch_markets(session)
-    if not markets:
-        await msg.edit_text("No active CS2 matches right now. Bot will notify when new matches appear 🔔")
-        return
-    list_cache[message.chat.id] = markets
-    await msg.edit_text(
-        "<b>🎮 CS2 matches on Polymarket</b> — " + str(len(markets)) + " active\nTap a team to make a prediction 👇",
-        parse_mode="HTML"
-    )
-    await send_list_page(message, markets, offset=0)
-
-
-@dp.message(Command("mystats"))
-async def cmd_mystats(message: types.Message):
-    chat_id = message.chat.id
-    stats = get_user_stats(chat_id)
-
-    if stats["total"] == 0:
-        await message.answer("📊 No predictions yet!\n\nMake predictions by tapping team buttons on new match notifications.")
-        return
-
-    pnl_str = ("+" if stats["total_pnl"] >= 0 else "") + str(stats["total_pnl"])
-    current_bank = stats["current_bank"]
-    bets_in_play = stats["pending"] * PAPER_BET_SIZE
-    text = (
-        "<b>📊 Your prediction stats</b>\n\n"
-        "💰 Bank: <b>$" + str(current_bank) + "</b> / $" + str(int(PAPER_BANK)) + "\n"
-        "🎯 Bet size: $" + str(int(PAPER_BET_SIZE)) + " | In play: $" + str(int(bets_in_play)) + "\n\n"
-        "Total picks: " + str(stats["total"]) + " | Pending: " + str(stats["pending"]) + "\n"
-        "✅ Wins: " + str(stats["wins"]) + "\n"
-        "❌ Losses: " + str(stats["losses"]) + "\n"
-        "Win rate: <b>" + str(stats["win_rate"]) + "%</b>\n"
-        "P&amp;L: <b>" + pnl_str + "$</b>\n\n"
-        "─────────────────\n"
-        "<b>Your picks:</b>\n\n"
-    )
-
-    for pred in stats["preds"].values():
-        entry = pred["entry_price"]
-        last = pred.get("last_price", entry)
-        delta = last - entry
-        delta_str = ("+" if delta >= 0 else "") + str(round(delta * 100)) + "c"
-
-        if pred.get("outcome") == "win":
-            icon = "✅"
-        elif pred.get("outcome") == "loss":
-            icon = "❌"
-        else:
-            icon = "⏳"
-
-        try:
-            ts = datetime.fromisoformat(pred["ts"]).strftime("%d.%m %H:%M")
-        except Exception:
-            ts = "?"
-
-        price_info = ""
-        if not pred.get("outcome"):
-            price_info = " | now " + str(round(last * 100)) + "c (" + delta_str + ")"
-
-        end_dt = pred.get("end_dt", "")
-        match_time = ("   📅 " + end_dt + " UTC\n") if end_dt else ""
-
-        # Экранируем спецсимволы HTML в названиях команд и вопросах
-        question = pred["question"][:45].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        chosen = pred["chosen_team"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-        text += (
-            icon + " <a href=\"" + pred["market_url"] + "\">" + question + "</a>\n"
-            + "   Pick: <b>" + chosen + "</b> @ " + str(round(entry * 100)) + "c"
-            + price_info + "\n"
-            + match_time
-            + "   🕐 " + ts + "\n\n"
-        )
-
-    if len(text) > 4000:
-        text = text[:4000] + "..."
-
-    try:
-        await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
-    except Exception as e:
-        log.warning("mystats send error: %s", e)
-        # Отправляем упрощённую версию без HTML если парсинг упал
-        await message.answer(
-            "📊 Stats: " + str(stats["wins"]) + "W / " + str(stats["losses"]) + "L | "
-            "Win rate: " + str(stats["win_rate"]) + "% | P&L: " + pnl_str + "$"
-        )
-
-
-@dp.message(Command("ranking"))
-async def cmd_ranking(message: types.Message):
-    ranking = hltv_ranking if hltv_ranking else FALLBACK_RANKING
-    top = sorted(ranking.items(), key=lambda x: x[1])[:30]
-    # Убираем дубликаты по рангу
-    seen_ranks = set()
-    unique = []
-    for name, rank in top:
-        if rank not in seen_ranks:
-            seen_ranks.add(rank)
-            unique.append((rank, name))
-    source = "live HLTV" if hltv_ranking else "fallback"
-    # Первое сообщение: #1-15
-    lines1 = ["<b>📊 HLTV Top 1-15:</b>\n"]
-    for rank, name in unique[:15]:
-        lines1.append("#" + str(rank) + " " + name.title())
-    await message.answer("\n".join(lines1), parse_mode="HTML")
-    # Второе сообщение: #16-30
-    if len(unique) > 15:
-        lines2 = ["<b>📊 HLTV Top 16-30:</b>\n"]
-        for rank, name in unique[15:30]:
-            lines2.append("#" + str(rank) + " " + name.title())
-        lines2.append("\nSource: " + source)
-        await message.answer("\n".join(lines2), parse_mode="HTML")
-
-
-@dp.message(Command("status"))
-async def cmd_status(message: types.Message):
-    subbed = "yes" if message.chat.id in subscribers else "no"
-    user_preds = predictions.get(message.chat.id, {})
-    pending = sum(1 for p in user_preds.values() if not p.get("outcome"))
+@dp.message(lambda m: m.text == "ℹ️ Как пользоваться")
+async def btn_help(message: types.Message):
     await message.answer(
-        "<b>Status</b>\n"
-        "Subscribed: " + subbed + "\n"
-        "Known markets: " + str(len(known_market_ids)) + "\n"
-        "HLTV teams: " + str(len(hltv_ranking)) + "\n"
-        "Predictions: " + str(len(user_preds)) + " total, " + str(pending) + " pending\n"
-        "Interval: " + str(CHECK_INTERVAL) + "s",
-        parse_mode="HTML",
-    )
+        "Пришли адрес кошелька Polymarket в формате 0x… (40 символов).\n\n"
+        "Найти кошелёк: на странице профиля трейдера он в URL после /profile/.\n\n"
+        "Бот скачает всю историю и разберёт стратегию.")
 
 
-# ─── Callbacks ────────────────────────────────────────────────────────────────
+@dp.message(Command("check"))
+async def cmd_check(message: types.Message):
+    m = WALLET_RE.search(message.text or "")
+    if not m:
+        await message.answer("Укажи адрес: /check 0x…")
+        return
+    await run_analysis(message, m.group(0))
 
-@dp.callback_query(lambda c: c.data == "list")
-async def cb_list(callback: types.CallbackQuery):
-    await callback.answer("Loading...")
-    await cmd_list(callback.message)
+
+# Любое сообщение с адресом кошелька → разбор
+@dp.message(lambda m: m.text and WALLET_RE.search(m.text))
+async def on_wallet(message: types.Message):
+    await run_analysis(message, WALLET_RE.search(message.text).group(0))
 
 
-@dp.callback_query(lambda c: c.data and c.data.startswith("list_more:"))
-async def cb_list_more(callback: types.CallbackQuery):
+# ─── Кнопки углубления ────────────────────────────────────────────────────────
+
+@dp.callback_query(lambda c: c.data == "a:cities")
+async def cb_cities(callback: types.CallbackQuery):
     await callback.answer()
-    chat_id = callback.message.chat.id
-    markets = list_cache.get(chat_id)
-    if not markets:
-        async with aiohttp.ClientSession() as session:
-            markets = await fetch_markets(session)
-        list_cache[chat_id] = markets
-    try:
-        offset = int(callback.data.split(":")[1])
-    except Exception:
-        offset = 0
-    await send_list_page(callback.message, markets, offset=offset)
+    data = last_analysis.get(callback.message.chat.id)
+    if not data:
+        await callback.message.answer("Сначала пришли кошелёк.")
+        return
+    await callback.message.answer(build_cities(data["positions"]),
+                                  parse_mode="HTML", disable_web_page_preview=True)
 
 
-@dp.callback_query(lambda c: c.data == "ranking")
-async def cb_ranking(callback: types.CallbackQuery):
+@dp.callback_query(lambda c: c.data == "a:recent")
+async def cb_recent(callback: types.CallbackQuery):
     await callback.answer()
-    await cmd_ranking(callback.message)
-
-
-@dp.callback_query(lambda c: c.data == "mystats")
-async def cb_mystats(callback: types.CallbackQuery):
-    await callback.answer()
-    await cmd_mystats(callback.message)
-
-
-@dp.callback_query(lambda c: c.data and c.data.startswith("pick:"))
-async def cb_pick(callback: types.CallbackQuery):
-    parts = callback.data.split(":")
-    if len(parts) != 3:
-        await callback.answer("Error")
+    data = last_analysis.get(callback.message.chat.id)
+    if not data:
+        await callback.message.answer("Сначала пришли кошелёк.")
         return
-
-    market_id = parts[1]
-    chosen_idx = int(parts[2])
-    chat_id = callback.message.chat.id
-
-    if chat_id in predictions and market_id in predictions[chat_id]:
-        existing = predictions[chat_id][market_id]
-        await callback.answer(
-            "Already picked " + existing["chosen_team"] + "!", show_alert=True
-        )
-        return
-
-    async with aiohttp.ClientSession() as session:
-        market = await fetch_market_by_id(session, market_id)
-
-    if not market:
-        await callback.answer("Could not load market", show_alert=True)
-        return
-
-    teams = extract_teams(market)
-    if not teams or chosen_idx >= len(teams):
-        await callback.answer("Market is no longer available", show_alert=True)
-        return
-
-    chosen_team = teams[chosen_idx]
-    prices = get_prices(market)
-    entry_price = prices[chosen_idx] if chosen_idx < len(prices) else 0.5
-
-    if chat_id not in predictions:
-        predictions[chat_id] = {}
-
-    end_raw = market.get("endDate", "")
-    try:
-        end_dt = datetime.fromisoformat(end_raw.replace("Z", "+00:00")).strftime("%d.%m.%Y %H:%M")
-    except Exception:
-        end_dt = ""
-
-    predictions[chat_id][market_id] = {
-        "question": market.get("question", "?"),
-        "chosen_team": chosen_team,
-        "chosen_idx": chosen_idx,
-        "entry_price": entry_price,
-        "last_price": entry_price,
-        "market_url": market_url(market),
-        "ts": datetime.now(timezone.utc).isoformat(),
-        "end_dt": end_dt,
-        "outcome": None,
-    }
-    save_predictions()
-
-    pot_win = round(PAPER_BET_SIZE * (1.0 / entry_price - 1), 2) if entry_price > 0 else 0
-    await callback.answer(
-        "✅ Picked " + chosen_team + " @ " + str(round(entry_price * 100)) + "c\n"
-        "Potential win: +$" + str(pot_win) + "\n"
-        "Price alerts: ON (±7%)",
-        show_alert=True
-    )
-    log.info("Prediction saved: chat=%s market=%s team=%s price=%.2f",
-             chat_id, market_id, chosen_team, entry_price)
+    await callback.message.answer(build_recent(data["trades"]),
+                                  parse_mode="HTML", disable_web_page_preview=True)
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -1028,16 +314,12 @@ async def cb_pick(callback: types.CallbackQuery):
 async def main():
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN is not set!")
-
-    # Загружаем данные при старте
-    load_subscribers()
-    load_predictions()
-    load_known_markets()
-
-    log.info("Starting bot... subscribers=%d predictions_users=%d known_markets=%d",
-             len(subscribers), len(predictions), len(known_market_ids))
-
-    asyncio.create_task(tracker())
+    from aiogram.types import BotCommand
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Старт"),
+        BotCommand(command="check", description="Разбор кошелька: /check 0x…"),
+    ])
+    log.info("Trader Check запущен")
     await dp.start_polling(bot)
 
 

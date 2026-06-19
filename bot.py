@@ -299,6 +299,138 @@ async def run_analysis(message, wallet):
 
 
 @dp.message(Command("start"))
+def build_deep(activity):
+    """ГЛУБОКИЙ посделочный разбор: группирует сырые сделки по рынку,
+    восстанавливает траекторию входов (когда, по какой цене, докупки),
+    выявляет РЕАЛЬНУЮ механику (усреднение, докупки в плюс/минус, тайминг)."""
+    from collections import defaultdict
+    trades = [a for a in activity if a.get("type") == "TRADE"]
+    if not trades:
+        return "Нет сделок типа TRADE для глубокого разбора."
+
+    # Группируем по рынку (conditionId)
+    by_market = defaultdict(list)
+    for t in trades:
+        by_market[t.get("conditionId")].append(t)
+
+    redeems = [a for a in activity if a.get("type") == "REDEEM"]
+    merges = [a for a in activity if a.get("type") == "MERGE"]
+    splits = [a for a in activity if a.get("type") == "SPLIT"]
+
+    L = ["🔬 ГЛУБОКИЙ РАЗБОР (посделочно)", ""]
+    L.append(f"Всего действий: {len(activity)}")
+    L.append(f"  TRADE {len(trades)} │ REDEEM {len(redeems)} │ "
+             f"MERGE {len(merges)} │ SPLIT {len(splits)}")
+    L.append(f"Уникальных рынков: {len(by_market)}")
+    L.append("")
+
+    # ── Паттерн докупок: сколько входов на рынок в среднем ──
+    entries_per_market = [len([t for t in tl if t.get("side")=="BUY"])
+                          for tl in by_market.values()]
+    avg_entries = sum(entries_per_market)/len(entries_per_market) if entries_per_market else 0
+    multi = sum(1 for e in entries_per_market if e > 1)
+    L.append(f"Входов (BUY) на рынок: среднее {avg_entries:.1f}")
+    L.append(f"  Докупал (>1 входа): {multi}/{len(by_market)} рынков "
+             f"({multi/len(by_market)*100:.0f}%)")
+
+    # ── Усреднение: докупал по более низкой или высокой цене? ──
+    avg_down = avg_up = same = 0
+    for tl in by_market.values():
+        buys = sorted([t for t in tl if t.get("side")=="BUY"],
+                      key=lambda x: x.get("timestamp",0))
+        if len(buys) < 2:
+            continue
+        first_p = float(buys[0].get("price",0) or 0)
+        last_p = float(buys[-1].get("price",0) or 0)
+        if last_p < first_p - 0.02: avg_down += 1
+        elif last_p > first_p + 0.02: avg_up += 1
+        else: same += 1
+    L.append(f"  Из докупавших: усреднял ВНИЗ {avg_down}, "
+             f"ВВЕРХ {avg_up}, ровно {same}")
+    L.append("")
+
+    # ── Тайминг: BUY/SELL и держит ли ──
+    buys = [t for t in trades if t.get("side")=="BUY"]
+    sells = [t for t in trades if t.get("side")=="SELL"]
+    L.append(f"BUY {len(buys)} / SELL {len(sells)}")
+    if len(sells) < len(buys)*0.2:
+        L.append("  → почти НЕ продаёт, держит до REDEEM")
+    L.append(f"REDEEM (погашений): {len(redeems)} — забирал выигрыш")
+    if merges:
+        L.append(f"⚠️ MERGE {len(merges)} — склеивал YES+NO пары (арбитраж/хедж)")
+    if splits:
+        L.append(f"⚠️ SPLIT {len(splits)} — дробил $1 на YES+NO")
+    L.append("")
+
+    # ── Цена входа по СЫРЫМ сделкам (не усреднённая!) ──
+    buy_prices = [float(t.get("price",0) or 0) for t in buys if t.get("price")]
+    if buy_prices:
+        med = sorted(buy_prices)[len(buy_prices)//2]
+        zones = {"1-5¢":0,"5-15¢":0,"15-35¢":0,"35-50¢":0,"50-65¢":0,"65¢+":0}
+        for pr in buy_prices:
+            if pr < 0.05: zones["1-5¢"] += 1
+            elif pr < 0.15: zones["5-15¢"] += 1
+            elif pr < 0.35: zones["15-35¢"] += 1
+            elif pr < 0.50: zones["35-50¢"] += 1
+            elif pr < 0.65: zones["50-65¢"] += 1
+            else: zones["65¢+"] += 1
+        L.append(f"Цена РЕАЛЬНЫХ входов (BUY): медиана {med*100:.0f}¢")
+        zline = " ".join(f"{z}:{c}" for z,c in zones.items() if c)
+        L.append(f"  {zline}")
+        # YES/NO по сырым сделкам
+        yes_b = sum(1 for t in buys if t.get("outcome")=="Yes")
+        no_b = sum(1 for t in buys if t.get("outcome")=="No")
+        L.append(f"  Покупки: YES {yes_b} / NO {no_b}")
+    L.append("")
+
+    # ── Размер сделок ──
+    usds = [float(t.get("usdcSize",0) or 0) for t in buys if t.get("usdcSize")]
+    if usds:
+        med_u = sorted(usds)[len(usds)//2]
+        L.append(f"Размер сделки (USDC): медиана ${med_u:.0f} "
+                 f"(${min(usds):.0f}–${max(usds):.0f})")
+
+    # ── Частота: сделок в день, всплески ──
+    ts = sorted([t.get("timestamp",0) for t in trades if t.get("timestamp")])
+    if len(ts) > 1:
+        span = (ts[-1]-ts[0])/86400
+        if span >= 1:
+            L.append(f"Период: {span:.0f} дней, {len(trades)/span:.1f} сделок/день")
+
+    return "\n".join(L)
+
+
+def build_market_detail(activity, n=3):
+    """Детализация НЕСКОЛЬКИХ рынков: полная траектория входов/выходов."""
+    from collections import defaultdict
+    trades = [a for a in activity if a.get("type") == "TRADE"]
+    by_market = defaultdict(list)
+    for t in trades:
+        by_market[t.get("conditionId")].append(t)
+    # Берём рынки с наибольшим числом сделок (где видна механика докупок)
+    markets_sorted = sorted(by_market.items(), key=lambda kv: -len(kv[1]))
+    L = ["🔍 ДЕТАЛИ РЫНКОВ (траектория входов)", ""]
+    for cid, tl in markets_sorted[:n]:
+        title = (tl[0].get("title","?") or "?")[:40]
+        L.append(f"📍 {title}")
+        tl_sorted = sorted(tl, key=lambda x: x.get("timestamp",0))
+        import datetime
+        for t in tl_sorted[:12]:  # до 12 сделок на рынок
+            side = t.get("side","?")
+            price = float(t.get("price",0) or 0)
+            usd = float(t.get("usdcSize",0) or 0)
+            out = t.get("outcome","")
+            ts = t.get("timestamp",0)
+            try:
+                dt = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).strftime("%d.%m %H:%M")
+            except Exception:
+                dt = "?"
+            emoji = "🟢" if side=="BUY" else "🔴"
+            L.append(f"  {emoji} {dt} {side} {out} {price*100:.0f}¢ ${usd:.0f}")
+        L.append("")
+    return "\n".join(L)
+
+
 async def cmd_start(message: types.Message):
     kb = ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="ℹ️ Как пользоваться")]],
@@ -330,6 +462,57 @@ async def cmd_check(message: types.Message):
         await message.answer("Укажи адрес: /check 0x…")
         return
     await run_analysis(message, m.group(0))
+
+
+@dp.message(Command("deep"))
+async def cmd_deep(message: types.Message):
+    m = WALLET_RE.search(message.text or "")
+    if not m:
+        await message.answer("Укажи адрес: /deep 0x…")
+        return
+    await run_deep(message, m.group(0))
+
+
+async def run_deep(message, wallet):
+    msg = await message.answer(f"🔬 Глубокий разбор {wallet[:12]}…\n"
+                               f"Качаю ВСЕ сделки посделочно…")
+    try:
+        async with aiohttp.ClientSession() as session:
+            # /activity — СЫРЫЕ сделки с timestamp, ценой, размером каждая
+            activity = await fetch_all(session, "activity",
+                                       {"user": wallet, "sortBy": "TIMESTAMP"},
+                                       page_size=500, max_pages=20)
+        if not activity:
+            await msg.edit_text("❌ Активности не нашёл. Проверь адрес.")
+            return
+        last_analysis[message.chat.id] = {"activity": activity, "wallet": wallet,
+                                          "deep": True}
+        text = build_deep(activity)
+        if len(text) > 4000:
+            text = text[:4000]
+        await msg.edit_text(text, disable_web_page_preview=True)
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🔍 Траектории рынков",
+                                 callback_data="d:detail")]])
+        await message.answer("Подробнее:", reply_markup=kb)
+    except Exception as e:
+        log.exception("run_deep failed")
+        err = f"❌ Ошибка: {type(e).__name__}: {e}"
+        try:
+            await msg.edit_text(err)
+        except Exception:
+            await message.answer(err)
+
+
+@dp.callback_query(lambda c: c.data == "d:detail")
+async def cb_detail(callback: types.CallbackQuery):
+    await callback.answer()
+    data = last_analysis.get(callback.message.chat.id)
+    if not data or "activity" not in data:
+        await callback.message.answer("Сначала сделай /deep 0x…")
+        return
+    await callback.message.answer(build_market_detail(data["activity"]),
+                                  disable_web_page_preview=True)
 
 
 # Любое сообщение с адресом кошелька → разбор
@@ -371,6 +554,7 @@ async def main():
     await bot.set_my_commands([
         BotCommand(command="start", description="Старт"),
         BotCommand(command="check", description="Разбор кошелька: /check 0x…"),
+        BotCommand(command="deep", description="Глубокий посделочный: /deep 0x…"),
     ])
     log.info("Trader Check запущен")
     await dp.start_polling(bot)

@@ -384,6 +384,223 @@ def build_inputs(activity):
     return "\n".join(L)
 
 
+def _parse_resolution_ts(title):
+    """Парсит дату резолюции из title погодного рынка. Формат обычно:
+    '...temperature in City on June 19' или '...on 2026-06-19'.
+    Возвращает timestamp конца того дня (UTC) или None."""
+    import datetime, re
+    t = title or ""
+    # Формат 2026-06-19
+    m = re.search(r"(\d{4})-(\d{2})-(\d{2})", t)
+    if m:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        try:
+            return datetime.datetime(y, mo, d, 23, 59, tzinfo=datetime.timezone.utc).timestamp()
+        except Exception:
+            return None
+    # Формат 'June 19' / 'Jun 19'
+    months = {"jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,"jul":7,
+              "aug":8,"sep":9,"oct":10,"nov":11,"dec":12}
+    m = re.search(r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+(\d{1,2})\b",
+                  t.lower())
+    if m:
+        mo = months[m.group(1)]
+        d = int(m.group(2))
+        # год берём текущий (2026); если месяц явно прошлый — ок, приблизительно
+        y = 2026
+        try:
+            return datetime.datetime(y, mo, d, 23, 59, tzinfo=datetime.timezone.utc).timestamp()
+        except Exception:
+            return None
+    return None
+
+
+def build_size_time(activity):
+    """РАЗМЕР и ВРЕМЯ: связь размера ставки с исходом (ставят ли крупнее
+    на то, что играет?), время удержания, за сколько часов до резолюции
+    входят. Отвечает на пункт 2 (размер как параметр отбора) и проверяет
+    наш вывод про поздний вход."""
+    from collections import defaultdict
+    trades = [a for a in activity if a.get("type") == "TRADE"]
+    redeems = [a for a in activity if a.get("type") == "REDEEM"]
+    if not trades:
+        return "Нет сделок для анализа."
+    redeemed_cids = set(a.get("conditionId") for a in redeems)
+
+    # Позиции: группируем BUY по рынку+стороне
+    by_pos = defaultdict(list)
+    for t in trades:
+        if t.get("side") == "BUY":
+            by_pos[(t.get("conditionId"), t.get("outcome"))].append(t)
+
+    L = ["💰 РАЗМЕР и ВРЕМЯ", ""]
+
+    # ── 1. РАЗМЕР СТАВКИ ↔ ИСХОД (главное — параметр отбора?) ──
+    # Для каждой позиции: суммарный вложенный размер + выиграла ли.
+    won_sizes, lost_sizes = [], []
+    for (cid, outcome), buys in by_pos.items():
+        total_usd = sum(float(b.get("usdcSize", 0) or 0) for b in buys)
+        if total_usd <= 0:
+            continue
+        if cid in redeemed_cids:
+            won_sizes.append(total_usd)
+        else:
+            lost_sizes.append(total_usd)
+    if won_sizes and lost_sizes:
+        won_med = sorted(won_sizes)[len(won_sizes)//2]
+        lost_med = sorted(lost_sizes)[len(lost_sizes)//2]
+        won_avg = sum(won_sizes)/len(won_sizes)
+        lost_avg = sum(lost_sizes)/len(lost_sizes)
+        L.append("Размер ставки ↔ исход (ставят крупнее на то, что играет?):")
+        L.append(f"  ВЫИГРАВШИЕ позиции: медиана ${won_med:.0f}, средн ${won_avg:.0f}")
+        L.append(f"  ПРОИГРАВШИЕ: медиана ${lost_med:.0f}, средн ${lost_avg:.0f}")
+        if won_med > lost_med * 1.3:
+            L.append("  → ДА: на выигравшие ставили ЗАМЕТНО крупнее!")
+            L.append("    Это параметр отбора — они ЗНАЮТ, на что ставить больше.")
+        elif lost_med > won_med * 1.3:
+            L.append("  → НЕТ, наоборот: крупнее на проигравшие (или усреднение вниз).")
+        else:
+            L.append("  → Размер примерно одинаков — НЕ параметр отбора.")
+        L.append("")
+
+    # ── 2. ВРЕМЯ УДЕРЖАНИЯ (BUY → SELL/REDEEM) ──
+    # Первый BUY по рынку → первый REDEEM/последний SELL.
+    sells_by_cid = defaultdict(list)
+    for a in activity:
+        if a.get("type") == "REDEEM":
+            sells_by_cid[a.get("conditionId")].append(("REDEEM", a.get("timestamp", 0)))
+        elif a.get("type") == "TRADE" and a.get("side") == "SELL":
+            sells_by_cid[a.get("conditionId")].append(("SELL", a.get("timestamp", 0)))
+    hold_hours = []
+    for (cid, outcome), buys in by_pos.items():
+        first_buy = min((b.get("timestamp", 0) for b in buys if b.get("timestamp")),
+                        default=0)
+        exits = sells_by_cid.get(cid, [])
+        if first_buy and exits:
+            exit_ts = min(ts for _, ts in exits if ts > first_buy) if any(ts > first_buy for _, ts in exits) else 0
+            if exit_ts:
+                hold_hours.append((exit_ts - first_buy) / 3600)
+    if hold_hours:
+        hold_med = sorted(hold_hours)[len(hold_hours)//2]
+        L.append(f"Время удержания (вход → выход): медиана {hold_med:.0f}ч")
+        fast = sum(1 for h in hold_hours if h < 1)
+        slow = sum(1 for h in hold_hours if h >= 24)
+        L.append(f"  быстрых (<1ч, ловля всплеска): {fast} │ "
+                 f"долгих (≥24ч, держание): {slow}")
+        L.append("")
+
+    # ── 3. ВРЕМЯ ДО РЕЗОЛЮЦИИ при входе (поздно ли входят?) ──
+    hours_before_res = []
+    for (cid, outcome), buys in by_pos.items():
+        first_buy = min((b.get("timestamp", 0) for b in buys if b.get("timestamp")),
+                        default=0)
+        res_ts = _parse_resolution_ts(buys[0].get("title", ""))
+        if first_buy and res_ts and res_ts > first_buy:
+            hours_before_res.append((res_ts - first_buy) / 3600)
+    if hours_before_res:
+        hb_med = sorted(hours_before_res)[len(hours_before_res)//2]
+        L.append(f"Вход за СКОЛЬКО часов до резолюции: медиана {hb_med:.0f}ч")
+        late = sum(1 for h in hours_before_res if h < 12)
+        early = sum(1 for h in hours_before_res if h >= 24)
+        L.append(f"  поздних (<12ч): {late} │ ранних (≥24ч): {early}")
+        L.append(f"  → Сравни с нами: мы входим за ~33ч (рано).")
+        if hb_med < 24:
+            L.append(f"    Они входят ПОЗЖЕ нас (медиана {hb_med:.0f}ч). Подтверждает.")
+    else:
+        L.append("Время до резолюции: не удалось распарсить даты из title.")
+
+    return "\n".join(L)
+
+
+def build_start_impact(activity):
+    """СТАРТ и ВЛИЯНИЕ: с чего начинал кошелёк (первые сделки, был ли
+    капитал), как менялся размер во времени, двигал ли цену своими
+    залпами (намёк на 'сам создаю всплеск')."""
+    from collections import defaultdict
+    import datetime
+    trades = [a for a in activity if a.get("type") == "TRADE"
+              and a.get("side") == "BUY"]
+    if not trades:
+        return "Нет покупок для анализа."
+    # Сортируем по времени
+    trades_sorted = sorted(trades, key=lambda x: x.get("timestamp", 0))
+
+    L = ["🚀 СТАРТ и ВЛИЯНИЕ НА ЦЕНУ", ""]
+
+    # ── 1. ПЕРВЫЕ СДЕЛКИ (с чего начал) ──
+    L.append("Первые сделки в доступной истории:")
+    for t in trades_sorted[:6]:
+        ts = t.get("timestamp", 0)
+        try:
+            dt = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).strftime("%d.%m %H:%M")
+        except Exception:
+            dt = "?"
+        price = float(t.get("price", 0) or 0)
+        usd = float(t.get("usdcSize", 0) or 0)
+        L.append(f"  {dt}: {price*100:.0f}¢ ${usd:.0f} ({t.get('outcome','')})")
+    first_usd = float(trades_sorted[0].get("usdcSize", 0) or 0)
+    if first_usd < 5:
+        L.append("  → начинал с МИКРО-ставок (как мы, без большого капитала)")
+    elif first_usd > 100:
+        L.append("  → начинал СРАЗУ КРУПНО (был капитал на старте)")
+    L.append("⚠️ API отдаёт последние ~10000 сделок — у старых кошельков")
+    L.append("   самое начало истории может быть НЕ видно.")
+    L.append("")
+
+    # ── 2. ЭВОЛЮЦИЯ РАЗМЕРА (первая треть vs последняя) ──
+    n = len(trades_sorted)
+    if n >= 30:
+        third = n // 3
+        early = [float(t.get("usdcSize", 0) or 0) for t in trades_sorted[:third]]
+        late = [float(t.get("usdcSize", 0) or 0) for t in trades_sorted[-third:]]
+        early_med = sorted(early)[len(early)//2]
+        late_med = sorted(late)[len(late)//2]
+        L.append(f"Эволюция размера ставки:")
+        L.append(f"  ранние сделки: медиана ${early_med:.0f}")
+        L.append(f"  поздние сделки: медиана ${late_med:.0f}")
+        if late_med > early_med * 1.5:
+            L.append("  → РОС размер (наращивал по мере роста капитала/уверенности)")
+        elif early_med > late_med * 1.5:
+            L.append("  → УМЕНЬШАЛ размер")
+        else:
+            L.append("  → размер стабилен")
+        L.append("")
+
+    # ── 3. ДВИГАЛ ЛИ ЦЕНУ (рост внутри залпа на одном рынке) ──
+    # Группируем по рынку, смотрим залпы (много покупок за короткое время),
+    # сравниваем цену первой и последней покупки в залпе.
+    by_market = defaultdict(list)
+    for t in trades_sorted:
+        by_market[t.get("conditionId")].append(t)
+    moved_up = 0
+    moved_examples = []
+    for cid, tl in by_market.items():
+        if len(tl) < 3:
+            continue
+        tl_sorted = sorted(tl, key=lambda x: x.get("timestamp", 0))
+        first_p = float(tl_sorted[0].get("price", 0) or 0)
+        last_p = float(tl_sorted[-1].get("price", 0) or 0)
+        first_ts = tl_sorted[0].get("timestamp", 0)
+        last_ts = tl_sorted[-1].get("timestamp", 0)
+        span_min = (last_ts - first_ts) / 60 if last_ts > first_ts else 0
+        # Залп = много покупок за <60 мин, цена выросла
+        if span_min < 60 and last_p > first_p * 1.5 and first_p > 0:
+            moved_up += 1
+            if len(moved_examples) < 3:
+                title = (tl_sorted[0].get("title", "?") or "?")[:30]
+                moved_examples.append(
+                    f"  {title}: {first_p*100:.0f}¢→{last_p*100:.0f}¢ "
+                    f"за {span_min:.0f}мин ({len(tl)} покупок)")
+    L.append(f"Цена росла ВНУТРИ его залпа (намёк на 'сам двигал'):")
+    L.append(f"  таких рынков: {moved_up}")
+    for ex in moved_examples:
+        L.append(ex)
+    L.append("⚠️ Это НЕ доказательство манипуляции — цену мог двигать")
+    L.append("   и рынок сам. Видим только ЕГО сделки, не весь стакан.")
+
+    return "\n".join(L)
+
+
 def build_deep(activity):
     """ГЛУБОКИЙ посделочный разбор: группирует сырые сделки по рынку,
     восстанавливает траекторию входов (когда, по какой цене, докупки),
@@ -580,7 +797,11 @@ async def run_deep(message, wallet):
             [InlineKeyboardButton(text="🔍 Траектории рынков",
                                   callback_data="d:detail")],
             [InlineKeyboardButton(text="📥 Матрица входов (цена/время→исход)",
-                                  callback_data="d:inputs")]])
+                                  callback_data="d:inputs")],
+            [InlineKeyboardButton(text="💰 Размер и время",
+                                  callback_data="d:sizetime")],
+            [InlineKeyboardButton(text="🚀 Старт и влияние на цену",
+                                  callback_data="d:startimpact")]])
         await message.answer("Подробнее:", reply_markup=kb)
     except Exception as e:
         log.exception("run_deep failed")
@@ -610,6 +831,28 @@ async def cb_inputs(callback: types.CallbackQuery):
         await callback.message.answer("Сначала сделай /deep 0x…")
         return
     await callback.message.answer(build_inputs(data["activity"]),
+                                  disable_web_page_preview=True)
+
+
+@dp.callback_query(lambda c: c.data == "d:sizetime")
+async def cb_sizetime(callback: types.CallbackQuery):
+    await callback.answer()
+    data = last_analysis.get(callback.message.chat.id)
+    if not data or "activity" not in data:
+        await callback.message.answer("Сначала сделай /deep 0x…")
+        return
+    await callback.message.answer(build_size_time(data["activity"]),
+                                  disable_web_page_preview=True)
+
+
+@dp.callback_query(lambda c: c.data == "d:startimpact")
+async def cb_startimpact(callback: types.CallbackQuery):
+    await callback.answer()
+    data = last_analysis.get(callback.message.chat.id)
+    if not data or "activity" not in data:
+        await callback.message.answer("Сначала сделай /deep 0x…")
+        return
+    await callback.message.answer(build_start_impact(data["activity"]),
                                   disable_web_page_preview=True)
 
 

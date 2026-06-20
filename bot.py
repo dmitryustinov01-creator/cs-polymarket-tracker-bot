@@ -299,6 +299,91 @@ async def run_analysis(message, wallet):
 
 
 @dp.message(Command("start"))
+def build_inputs(activity):
+    """МАТРИЦА ВХОДОВ: связывает цену и время входа с ИСХОДОМ (выиграл/нет).
+    Отвечает: на какой цене входа и в какое время трейдер выигрывает чаще.
+    Для сравнения с нашими входами (медиана ~2¢, за 33ч до резолюции)."""
+    from collections import defaultdict
+    import datetime
+    trades = [a for a in activity if a.get("type") == "TRADE"]
+    redeems = [a for a in activity if a.get("type") == "REDEEM"]
+    if not trades:
+        return "Нет сделок для анализа входов."
+
+    # conditionId, по которым был REDEEM = выигрыш (погасил по $1)
+    redeemed_cids = set(a.get("conditionId") for a in redeems)
+
+    # Группируем BUY по рынку+стороне
+    by_pos = defaultdict(list)
+    for t in trades:
+        if t.get("side") == "BUY":
+            key = (t.get("conditionId"), t.get("outcome"))
+            by_pos[key].append(t)
+
+    # Для каждой позиции: средняя цена входа, выиграл ли, час входа
+    positions = []
+    for (cid, outcome), buys in by_pos.items():
+        prices = [float(b.get("price",0) or 0) for b in buys if b.get("price")]
+        if not prices:
+            continue
+        avg_entry = sum(prices)/len(prices)
+        # Выигрыш: был REDEEM по рынку. (грубо, но REDEEM = погашение $1)
+        won = cid in redeemed_cids
+        # Час первого входа (UTC)
+        ts = min(b.get("timestamp",0) for b in buys if b.get("timestamp"))
+        hour = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).hour if ts else -1
+        positions.append({"entry": avg_entry, "won": won, "hour": hour,
+                          "title": buys[0].get("title","")})
+
+    if not positions:
+        return "Не удалось разобрать входы."
+
+    n = len(positions)
+    L = ["📥 МАТРИЦА ВХОДОВ (цена/время → исход)", ""]
+    L.append(f"Позиций: {n}, из них выиграло (REDEEM): "
+             f"{sum(1 for p in positions if p['won'])}")
+    L.append("")
+
+    # ── ВИНРЕЙТ ПО ЗОНЕ ЦЕНЫ ВХОДА (главное!) ──
+    zones = [(0,0.03,"1-3¢"),(0.03,0.07,"3-7¢"),(0.07,0.15,"7-15¢"),
+             (0.15,0.35,"15-35¢"),(0.35,0.65,"35-65¢"),(0.65,1.01,"65¢+")]
+    L.append("Винрейт по ЦЕНЕ входа (где edge):")
+    for lo, hi, lbl in zones:
+        sub = [p for p in positions if lo <= p["entry"] < hi]
+        if not sub:
+            continue
+        w = sum(1 for p in sub if p["won"])
+        L.append(f"  {lbl}: {w}/{len(sub)} ({w/len(sub)*100:.0f}% выиграло)")
+    L.append("")
+
+    # ── РАСПРЕДЕЛЕНИЕ входов по цене ──
+    cheap = sum(1 for p in positions if p["entry"] < 0.03)
+    med_entry = sorted([p["entry"] for p in positions])[n//2]
+    L.append(f"Медиана входа: {med_entry*100:.0f}¢")
+    L.append(f"  Очень дешёвых (<3¢): {cheap} ({cheap/n*100:.0f}%)")
+    L.append("")
+
+    # ── ВИНРЕЙТ ПО ЧАСУ ВХОДА (рано/поздно) ──
+    L.append("Винрейт по часу входа (UTC):")
+    by_hour = defaultdict(lambda: {"n":0,"w":0})
+    for p in positions:
+        if p["hour"] < 0: continue
+        # группируем в блоки по 6 часов
+        block = (p["hour"]//6)*6
+        by_hour[block]["n"] += 1
+        if p["won"]: by_hour[block]["w"] += 1
+    for block in sorted(by_hour):
+        d = by_hour[block]
+        L.append(f"  {block:02d}-{block+6:02d}ч: {d['w']}/{d['n']} "
+                 f"({d['w']/d['n']*100:.0f}%)")
+
+    L.append("")
+    L.append("→ Сравни с нашими: медиана входа ~2¢, вход за ~33ч.")
+    L.append("Если у них дороже (7-17¢) выигрывает чаще — мы лезем")
+    L.append("в слишком дешёвые хвосты.")
+    return "\n".join(L)
+
+
 def build_deep(activity):
     """ГЛУБОКИЙ посделочный разбор: группирует сырые сделки по рынку,
     восстанавливает траекторию входов (когда, по какой цене, докупки),
@@ -491,9 +576,11 @@ async def run_deep(message, wallet):
         if len(text) > 4000:
             text = text[:4000]
         await msg.edit_text(text, disable_web_page_preview=True)
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="🔍 Траектории рынков",
-                                 callback_data="d:detail")]])
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔍 Траектории рынков",
+                                  callback_data="d:detail")],
+            [InlineKeyboardButton(text="📥 Матрица входов (цена/время→исход)",
+                                  callback_data="d:inputs")]])
         await message.answer("Подробнее:", reply_markup=kb)
     except Exception as e:
         log.exception("run_deep failed")
@@ -512,6 +599,17 @@ async def cb_detail(callback: types.CallbackQuery):
         await callback.message.answer("Сначала сделай /deep 0x…")
         return
     await callback.message.answer(build_market_detail(data["activity"]),
+                                  disable_web_page_preview=True)
+
+
+@dp.callback_query(lambda c: c.data == "d:inputs")
+async def cb_inputs(callback: types.CallbackQuery):
+    await callback.answer()
+    data = last_analysis.get(callback.message.chat.id)
+    if not data or "activity" not in data:
+        await callback.message.answer("Сначала сделай /deep 0x…")
+        return
+    await callback.message.answer(build_inputs(data["activity"]),
                                   disable_web_page_preview=True)
 
 

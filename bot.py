@@ -492,26 +492,24 @@ async def build_weather_check(session, activity, limit=10):
 
     L.append("")
     if checked:
-        L.append(f"ИТОГ ({checked} проверено) — прошёл ли ПИК дня при входе:")
-        L.append(f"  ✅ пик уже пройден (вход на факт): {on_fact} ({on_fact/checked*100:.0f}%)")
-        L.append(f"  ◐ пик близко (±3°): {below}")
-        L.append(f"  ⬆️ пик впереди (вход вслепую): {above}")
+        L.append(f"ИТОГ ({checked} проверено) — вход относительно факта:")
+        L.append(f"  ✅ исход уже подтверждён фактом: {on_fact} ({on_fact/checked*100:.0f}%)")
+        L.append(f"  ❌ вход против факта: {against}")
+        L.append(f"  ◐ факт ещё не определил исход: {unclear}")
         L.append("")
-        near = on_fact + below
         if on_fact / checked > 0.5:
-            L.append("→ ГИПОТЕЗА ПОДТВЕРЖДАЕТСЯ: входят когда пик дня уже виден!")
+            L.append("→ ГИПОТЕЗА ПОДТВЕРЖДАЕТСЯ: входят когда исход уже виден!")
             L.append("  Edge — поздний вход на свершившийся факт, не прогноз.")
-        elif near / checked > 0.6:
-            L.append("→ ЧАСТИЧНО: входят когда пик близко (факт почти ясен).")
+        elif (on_fact + unclear) / checked > 0.7 and on_fact > against:
+            L.append("→ ЧАСТИЧНО: чаще входят на факт, чем против.")
         else:
-            L.append("→ Гипотеза слабая: входят когда пик ещё впереди (вслепую).")
+            L.append("→ Гипотеза слабая на этой выборке.")
     L.append("")
     L.append("⚠️ Пилот, малая выборка. Open-Meteo ≈ станция (±1-2°).")
-    L.append("Часовой пояс без лета. 'Пик' по почасовому факту. Для тренда.")
+    L.append("Часовой пояс без лета. Учтена сторона YES/NO. Для тренда.")
     return "\n".join(L)
 
 
-@dp.message(Command("start"))
 def build_inputs(activity):
     """МАТРИЦА ВХОДОВ: связывает цену и время входа с ИСХОДОМ (выиграл/нет).
     Отвечает: на какой цене входа и в какое время трейдер выигрывает чаще.
@@ -946,6 +944,7 @@ def build_market_detail(activity, n=3):
     return "\n".join(L)
 
 
+@dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     kb = ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="ℹ️ Как пользоваться")]],

@@ -380,45 +380,46 @@ async def build_weather_check(session, activity, limit=10):
     """
     trades = [a for a in activity if a.get("type") == "TRADE"
               and a.get("side") == "BUY"]
-    # Уникальные погодные позиции (рынок+сторона), берём первый вход
-    seen = set()
-    weather_trades = []
+    # Группируем BUY по рынку+стороне; берём ОСНОВНОЙ вход (с макс usdcSize,
+    # не первую утреннюю пробу — это чинит баг с входом в 8 утра).
+    from collections import defaultdict
+    pos_trades = defaultdict(list)
     for t in trades:
         title = t.get("title", "")
-        city = _city_from_title(title)
-        bucket = _parse_bucket(title)
-        res_ts = _parse_resolution_ts(title)
-        if not (city and bucket and res_ts):
+        if not (_city_from_title(title) and _parse_bucket(title)
+                and _parse_resolution_ts(title)):
             continue
-        key = t.get("conditionId")
-        if key in seen:
-            continue
-        seen.add(key)
-        weather_trades.append(t)
-        if len(weather_trades) >= limit:
+        pos_trades[(t.get("conditionId"), t.get("outcome"))].append(t)
+
+    weather_positions = []
+    for (cid, outcome), tl in pos_trades.items():
+        # основной вход = сделка с наибольшим usdcSize (туда вложил больше всего)
+        main_t = max(tl, key=lambda x: float(x.get("usdcSize", 0) or 0))
+        weather_positions.append((main_t, outcome, len(tl)))
+        if len(weather_positions) >= limit:
             break
 
-    if not weather_trades:
+    if not weather_positions:
         return ("Не нашёл погодных сделок с распознаваемым городом/бакетом/датой.\n"
                 "Возможно, у этого трейдера другой формат title.")
 
-    L = [f"🌡 СВЕРКА ВХОДОВ С ФАКТОМ (пилот, {len(weather_trades)} сделок)", ""]
-    L.append("Гипотеза: входят, когда дневной максимум УЖЕ виден.")
+    L = [f"🌡 СВЕРКА ВХОДОВ С ФАКТОМ (пилот, {len(weather_positions)} позиций)", ""]
+    L.append("Гипотеза: входят, когда исход УЖЕ ясен по факту погоды.")
+    L.append("(YES — факт уже в бакете; NO — факт уже вне бакета)")
     L.append("")
 
-    on_fact = 0      # вошёл когда максимум УЖЕ в бакете
-    below = 0        # максимум ниже бакета (ставка на рост)
-    above = 0        # максимум выше бакета (бакет уже пробит)
+    on_fact = 0      # вход когда исход УЖЕ подтверждён фактом (с учётом стороны)
+    against = 0      # вход против факта (рискованная ставка)
+    unclear = 0      # факт ещё не определил исход (макс не наступил)
     checked = 0
 
-    for t in weather_trades:
-        title = t.get("title", "")
+    for main_t, outcome, n_entries in weather_positions:
+        title = main_t.get("title", "")
         city = _city_from_title(title)
         lat, lon, tz = CITY_COORDS[city]
         bucket = _parse_bucket(title)
         fahr = _is_fahrenheit(title)
-        entry_ts = t.get("timestamp", 0)
-        # Дата резолюции из title
+        entry_ts = main_t.get("timestamp", 0)
         res_ts = _parse_resolution_ts(title)
         import datetime
         res_date = datetime.datetime.fromtimestamp(res_ts, datetime.timezone.utc)
@@ -430,13 +431,10 @@ async def build_weather_check(session, activity, limit=10):
             continue
         checked += 1
 
-        # Час входа в ЛОКАЛЬНОМ времени города
         entry_dt_utc = datetime.datetime.fromtimestamp(entry_ts, datetime.timezone.utc)
         entry_local_hour = (entry_dt_utc.hour + tz) % 24
-        # День мог сдвинуться, но для максимума берём часы того же дня до входа
 
-        # Фактический максимум С НАЧАЛА ДНЯ ДО часа входа (по UTC-времени факта,
-        # сдвинутого на tz). Часы в hourly — UTC. Локальный час = utc_hour + tz.
+        # Факт. максимум С НАЧАЛА ДНЯ ДО часа входа + ПОЛНЫЙ дневной максимум.
         max_so_far = None
         day_max = None
         for tstr, temp in hourly:
@@ -446,7 +444,6 @@ async def build_weather_check(session, activity, limit=10):
             h_local = (h_utc + tz) % 24
             if day_max is None or temp > day_max:
                 day_max = temp
-            # учитываем часы ДО входа (по локальному часу)
             if h_local <= entry_local_hour:
                 if max_so_far is None or temp > max_so_far:
                     max_so_far = temp
@@ -454,36 +451,63 @@ async def build_weather_check(session, activity, limit=10):
             max_so_far = hourly[0][1]
 
         lo, hi = bucket
-        # Где максимум-на-момент-входа относительно бакета
-        if lo <= max_so_far <= hi:
-            on_fact += 1
-            verdict = "✅ В бакете (вход на факт)"
-        elif max_so_far < lo:
-            below += 1
-            verdict = "⬆️ ниже (ставка на рост)"
+        is_yes = (outcome == "Yes")
+        # Накрыл ли факт-максимум-на-входе бакет?
+        in_bucket = (lo <= max_so_far <= hi)
+        above_bucket = (max_so_far > hi)
+        # Может ли максимум ЕЩЁ вырасти в бакет? (день не закончился)
+        can_still_rise = (max_so_far < hi)
+
+        # ЛОГИКА С УЧЁТОМ СТОРОНЫ:
+        if is_yes:
+            # YES бакета: ставит ЧТО максимум будет в бакете.
+            # "на факт" = факт УЖЕ в бакете (подтверждён).
+            if in_bucket:
+                verdict = "✅ YES: факт уже в бакете"
+                on_fact += 1
+            elif above_bucket:
+                verdict = "❌ YES: факт уже ВЫШЕ (проигран)"
+                against += 1
+            else:
+                verdict = "⬆️ YES: факт ниже, ждёт роста"
+                unclear += 1
         else:
-            above += 1
-            verdict = "❌ выше (бакет пробит)"
+            # NO бакета: ставит ЧТО максимум НЕ в бакете.
+            # "на факт" = факт УЖЕ вне бакета (выше — бакет точно проигран → NO выигр).
+            if above_bucket:
+                verdict = "✅ NO: факт уже выше бакета (NO подтверждён)"
+                on_fact += 1
+            elif in_bucket:
+                verdict = "❌ NO: факт в бакете (NO под угрозой)"
+                against += 1
+            else:
+                verdict = "⬇️ NO: факт ниже, бакет ещё возможен"
+                unclear += 1
 
         unit = "F" if fahr else "C"
-        L.append(f"{city[:12]} {date_str[5:]}: вход {entry_local_hour}ч мест., "
-                 f"факт-макс {max_so_far:.0f}°{unit}, бакет {lo:.0f}-{hi:.0f} → {verdict}")
+        side_s = "YES" if is_yes else "NO"
+        L.append(f"{city[:11]} {date_str[5:]} {side_s} вх{entry_local_hour}ч: "
+                 f"факт-макс {max_so_far:.0f}°{unit} "
+                 f"(день {day_max:.0f}°), бакет {lo:.0f}-{hi:.0f} → {verdict}")
 
     L.append("")
     if checked:
-        L.append(f"ИТОГ ({checked} проверено):")
-        L.append(f"  ✅ вход на свершившийся максимум: {on_fact} ({on_fact/checked*100:.0f}%)")
-        L.append(f"  ⬆️ ставка на рост (макс ниже): {below}")
-        L.append(f"  ❌ бакет уже пробит: {above}")
+        L.append(f"ИТОГ ({checked} проверено) — прошёл ли ПИК дня при входе:")
+        L.append(f"  ✅ пик уже пройден (вход на факт): {on_fact} ({on_fact/checked*100:.0f}%)")
+        L.append(f"  ◐ пик близко (±3°): {below}")
+        L.append(f"  ⬆️ пик впереди (вход вслепую): {above}")
         L.append("")
+        near = on_fact + below
         if on_fact / checked > 0.5:
-            L.append("→ ГИПОТЕЗА ПОДТВЕРЖДАЕТСЯ: входят на уже-известный максимум!")
-            L.append("  Их edge — поздний вход, когда погода ясна по факту.")
+            L.append("→ ГИПОТЕЗА ПОДТВЕРЖДАЕТСЯ: входят когда пик дня уже виден!")
+            L.append("  Edge — поздний вход на свершившийся факт, не прогноз.")
+        elif near / checked > 0.6:
+            L.append("→ ЧАСТИЧНО: входят когда пик близко (факт почти ясен).")
         else:
-            L.append("→ Гипотеза слабая на этой выборке. Входят не на факт.")
+            L.append("→ Гипотеза слабая: входят когда пик ещё впереди (вслепую).")
     L.append("")
-    L.append("⚠️ Пилот на малой выборке. Open-Meteo ≈ станция (не точь-в-точь).")
-    L.append("Часовой пояс без летнего времени. Для тренда, не точных чисел.")
+    L.append("⚠️ Пилот, малая выборка. Open-Meteo ≈ станция (±1-2°).")
+    L.append("Часовой пояс без лета. 'Пик' по почасовому факту. Для тренда.")
     return "\n".join(L)
 
 

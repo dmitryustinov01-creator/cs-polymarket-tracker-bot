@@ -27,6 +27,77 @@ last_analysis: dict = {}
 
 WALLET_RE = re.compile(r"0x[a-fA-F0-9]{40}")
 
+# ── Справочник погодных городов Polymarket: координаты + часовой пояс ──────────
+CITY_COORDS = {
+    "tokyo":(35.69,139.69,9),"seoul":(37.57,126.98,9),"shanghai":(31.23,121.47,8),
+    "shenzhen":(22.54,114.06,8),"guangzhou":(23.13,113.26,8),"hong kong":(22.30,114.17,8),
+    "beijing":(39.90,116.41,8),"taipei":(25.03,121.57,8),"singapore":(1.35,103.82,8),
+    "karachi":(24.86,67.00,5),"lucknow":(26.85,80.95,5),"delhi":(28.61,77.21,5),
+    "mumbai":(19.08,72.88,5),"london":(51.51,-0.13,0),"paris":(48.86,2.35,1),
+    "madrid":(40.42,-3.70,1),"milan":(45.46,9.19,1),"munich":(48.14,11.58,1),
+    "moscow":(55.76,37.62,3),"istanbul":(41.01,28.98,3),"new york":(40.71,-74.01,-5),
+    "houston":(29.76,-95.37,-6),"austin":(30.27,-97.74,-6),"los angeles":(34.05,-118.24,-8),
+    "chicago":(41.88,-87.63,-6),"sao paulo":(-23.55,-46.63,-3),"panama city":(8.98,-79.52,-5),
+    "dubai":(25.20,55.27,4),
+}
+
+def _city_from_title(title):
+    t = (title or "").lower()
+    for city in CITY_COORDS:
+        if city in t:
+            return city
+    return None
+
+def _parse_bucket(title):
+    """Парсит температурный бакет из title. (lo, hi) в шкале title."""
+    t = title or ""
+    # Убираем дату YYYY-MM-DD, иначе '2026-06' ловится как диапазон температур
+    t = re.sub(r"\d{4}-\d{2}-\d{2}", "", t)
+    m = re.search(r"(-?\d+(?:\.\d+)?)\s*(?:-|to|–|—)\s*(-?\d+(?:\.\d+)?)", t)
+    if m:
+        return (float(m.group(1)), float(m.group(2)))
+    m = re.search(r"(?:above|higher than|greater than|over|more than|≥|>=?)\s*(-?\d+(?:\.\d+)?)", t, re.I)
+    if m:
+        return (float(m.group(1)), 999.0)
+    m = re.search(r"(?:below|lower than|less than|under|≤|<=?)\s*(-?\d+(?:\.\d+)?)", t, re.I)
+    if m:
+        return (-999.0, float(m.group(1)))
+    m = re.search(r"\bbe\s+(-?\d+(?:\.\d+)?)\s*°?[CF]", t, re.I)
+    if m:
+        v = float(m.group(1))
+        return (v - 0.5, v + 0.5)
+    return None
+
+def _is_fahrenheit(title):
+    t = (title or "").lower()
+    if "°f" in t or "fahrenheit" in t:
+        return True
+    for c in ["new york","houston","austin","los angeles","chicago"]:
+        if c in t:
+            return True
+    return False
+
+async def fetch_hourly_actual(session, lat, lon, date_str, fahrenheit):
+    """Почасовая ФАКТИЧЕСКАЯ температура за день (Open-Meteo archive)."""
+    unit = "fahrenheit" if fahrenheit else "celsius"
+    url = "https://archive-api.open-meteo.com/v1/archive"
+    params = {"latitude": lat, "longitude": lon, "start_date": date_str,
+              "end_date": date_str, "hourly": "temperature_2m",
+              "temperature_unit": unit, "timezone": "UTC"}
+    try:
+        async with session.get(url, params=params,
+                               timeout=aiohttp.ClientTimeout(total=30)) as r:
+            if r.status != 200:
+                return None
+            data = await r.json()
+            temps = data.get("hourly", {}).get("temperature_2m", [])
+            times = data.get("hourly", {}).get("time", [])
+            return list(zip(times, temps))
+    except Exception as e:
+        log.warning("open-meteo %s %s: %s", lat, date_str, e)
+        return None
+
+
 
 # ─── Загрузка данных с пагинацией ─────────────────────────────────────────────
 
@@ -296,6 +367,124 @@ async def run_analysis(message, wallet):
             await msg.edit_text(err)
         except Exception:
             await message.answer(err)
+
+
+async def build_weather_check(session, activity, limit=10):
+    """ПИЛОТ: сверяет входы трейдера с ФАКТИЧЕСКОЙ погодой на момент входа.
+    Гипотеза: они входят, когда дневной максимум УЖЕ виден (вход на факт).
+    Для каждой погодной сделки:
+      - парсит город, дату, бакет, время входа
+      - тянет почасовой факт того дня (Open-Meteo)
+      - считает фактический максимум ДО часа входа (по локальному времени)
+      - сравнивает с бакетом: максимум уже В бакете / НИЖЕ / ВЫШЕ
+    """
+    trades = [a for a in activity if a.get("type") == "TRADE"
+              and a.get("side") == "BUY"]
+    # Уникальные погодные позиции (рынок+сторона), берём первый вход
+    seen = set()
+    weather_trades = []
+    for t in trades:
+        title = t.get("title", "")
+        city = _city_from_title(title)
+        bucket = _parse_bucket(title)
+        res_ts = _parse_resolution_ts(title)
+        if not (city and bucket and res_ts):
+            continue
+        key = t.get("conditionId")
+        if key in seen:
+            continue
+        seen.add(key)
+        weather_trades.append(t)
+        if len(weather_trades) >= limit:
+            break
+
+    if not weather_trades:
+        return ("Не нашёл погодных сделок с распознаваемым городом/бакетом/датой.\n"
+                "Возможно, у этого трейдера другой формат title.")
+
+    L = [f"🌡 СВЕРКА ВХОДОВ С ФАКТОМ (пилот, {len(weather_trades)} сделок)", ""]
+    L.append("Гипотеза: входят, когда дневной максимум УЖЕ виден.")
+    L.append("")
+
+    on_fact = 0      # вошёл когда максимум УЖЕ в бакете
+    below = 0        # максимум ниже бакета (ставка на рост)
+    above = 0        # максимум выше бакета (бакет уже пробит)
+    checked = 0
+
+    for t in weather_trades:
+        title = t.get("title", "")
+        city = _city_from_title(title)
+        lat, lon, tz = CITY_COORDS[city]
+        bucket = _parse_bucket(title)
+        fahr = _is_fahrenheit(title)
+        entry_ts = t.get("timestamp", 0)
+        # Дата резолюции из title
+        res_ts = _parse_resolution_ts(title)
+        import datetime
+        res_date = datetime.datetime.fromtimestamp(res_ts, datetime.timezone.utc)
+        date_str = res_date.strftime("%Y-%m-%d")
+
+        hourly = await fetch_hourly_actual(session, lat, lon, date_str, fahr)
+        await asyncio.sleep(0.2)
+        if not hourly:
+            continue
+        checked += 1
+
+        # Час входа в ЛОКАЛЬНОМ времени города
+        entry_dt_utc = datetime.datetime.fromtimestamp(entry_ts, datetime.timezone.utc)
+        entry_local_hour = (entry_dt_utc.hour + tz) % 24
+        # День мог сдвинуться, но для максимума берём часы того же дня до входа
+
+        # Фактический максимум С НАЧАЛА ДНЯ ДО часа входа (по UTC-времени факта,
+        # сдвинутого на tz). Часы в hourly — UTC. Локальный час = utc_hour + tz.
+        max_so_far = None
+        day_max = None
+        for tstr, temp in hourly:
+            if temp is None:
+                continue
+            h_utc = int(tstr[11:13])
+            h_local = (h_utc + tz) % 24
+            if day_max is None or temp > day_max:
+                day_max = temp
+            # учитываем часы ДО входа (по локальному часу)
+            if h_local <= entry_local_hour:
+                if max_so_far is None or temp > max_so_far:
+                    max_so_far = temp
+        if max_so_far is None:
+            max_so_far = hourly[0][1]
+
+        lo, hi = bucket
+        # Где максимум-на-момент-входа относительно бакета
+        if lo <= max_so_far <= hi:
+            on_fact += 1
+            verdict = "✅ В бакете (вход на факт)"
+        elif max_so_far < lo:
+            below += 1
+            verdict = "⬆️ ниже (ставка на рост)"
+        else:
+            above += 1
+            verdict = "❌ выше (бакет пробит)"
+
+        unit = "F" if fahr else "C"
+        L.append(f"{city[:12]} {date_str[5:]}: вход {entry_local_hour}ч мест., "
+                 f"факт-макс {max_so_far:.0f}°{unit}, бакет {lo:.0f}-{hi:.0f} → {verdict}")
+
+    L.append("")
+    if checked:
+        L.append(f"ИТОГ ({checked} проверено):")
+        L.append(f"  ✅ вход на свершившийся максимум: {on_fact} ({on_fact/checked*100:.0f}%)")
+        L.append(f"  ⬆️ ставка на рост (макс ниже): {below}")
+        L.append(f"  ❌ бакет уже пробит: {above}")
+        L.append("")
+        if on_fact / checked > 0.5:
+            L.append("→ ГИПОТЕЗА ПОДТВЕРЖДАЕТСЯ: входят на уже-известный максимум!")
+            L.append("  Их edge — поздний вход, когда погода ясна по факту.")
+        else:
+            L.append("→ Гипотеза слабая на этой выборке. Входят не на факт.")
+    L.append("")
+    L.append("⚠️ Пилот на малой выборке. Open-Meteo ≈ станция (не точь-в-точь).")
+    L.append("Часовой пояс без летнего времени. Для тренда, не точных чисел.")
+    return "\n".join(L)
 
 
 @dp.message(Command("start"))
@@ -801,7 +990,9 @@ async def run_deep(message, wallet):
             [InlineKeyboardButton(text="💰 Размер и время",
                                   callback_data="d:sizetime")],
             [InlineKeyboardButton(text="🚀 Старт и влияние на цену",
-                                  callback_data="d:startimpact")]])
+                                  callback_data="d:startimpact")],
+            [InlineKeyboardButton(text="🌡 Сверка входов с фактом погоды",
+                                  callback_data="d:weather")]])
         await message.answer("Подробнее:", reply_markup=kb)
     except Exception as e:
         log.exception("run_deep failed")
@@ -854,6 +1045,26 @@ async def cb_startimpact(callback: types.CallbackQuery):
         return
     await callback.message.answer(build_start_impact(data["activity"]),
                                   disable_web_page_preview=True)
+
+
+@dp.callback_query(lambda c: c.data == "d:weather")
+async def cb_weather(callback: types.CallbackQuery):
+    await callback.answer()
+    data = last_analysis.get(callback.message.chat.id)
+    if not data or "activity" not in data:
+        await callback.message.answer("Сначала сделай /deep 0x…")
+        return
+    msg = await callback.message.answer("🌡 Тяну факт погоды с Open-Meteo… "
+                                        "(до минуты)")
+    try:
+        async with aiohttp.ClientSession() as session:
+            text = await build_weather_check(session, data["activity"], limit=10)
+        if len(text) > 4000:
+            text = text[:4000]
+        await msg.edit_text(text, disable_web_page_preview=True)
+    except Exception as e:
+        log.exception("weather check failed")
+        await msg.edit_text(f"❌ Ошибка сверки: {type(e).__name__}: {e}")
 
 
 # Любое сообщение с адресом кошелька → разбор

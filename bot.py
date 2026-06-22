@@ -1,4 +1,5 @@
 import asyncio
+import math
 import logging
 import os
 import re
@@ -944,6 +945,148 @@ def build_market_detail(activity, n=3):
     return "\n".join(L)
 
 
+async def fetch_daily_max_actual(session, lat, lon, start, end):
+    """Фактический дневной максимум за период (Open-Meteo Archive)."""
+    url = "https://archive-api.open-meteo.com/v1/archive"
+    params = {"latitude": lat, "longitude": lon, "start_date": start,
+              "end_date": end, "daily": "temperature_2m_max", "timezone": "UTC"}
+    try:
+        async with session.get(url, params=params,
+                               timeout=aiohttp.ClientTimeout(total=60)) as r:
+            if r.status != 200:
+                return {}
+            d = (await r.json()).get("daily", {})
+            return dict(zip(d.get("time", []), d.get("temperature_2m_max", [])))
+    except Exception as e:
+        log.warning("hist actual: %s", e)
+        return {}
+
+
+async def fetch_forecast_models(session, lat, lon, start, end):
+    """Архив прогнозов по нескольким моделям (Historical Forecast API).
+    Возвращает {date: [прогноз_модель1, прогноз_модель2, ...]}.
+    Разброс моделей = наша σ (как в ансамбле бота)."""
+    from collections import defaultdict
+    url = "https://historical-forecast-api.open-meteo.com/v1/forecast"
+    models = ["gfs_seamless", "ecmwf_ifs025", "icon_seamless", "gem_seamless"]
+    out = defaultdict(list)
+    for model in models:
+        params = {"latitude": lat, "longitude": lon, "start_date": start,
+                  "end_date": end, "daily": "temperature_2m_max",
+                  "timezone": "UTC", "models": model}
+        try:
+            async with session.get(url, params=params,
+                                   timeout=aiohttp.ClientTimeout(total=60)) as r:
+                if r.status != 200:
+                    continue
+                d = (await r.json()).get("daily", {})
+                for date, temp in zip(d.get("time", []),
+                                      d.get("temperature_2m_max", [])):
+                    if temp is not None:
+                        out[date].append(temp)
+        except Exception as e:
+            log.warning("hist forecast %s: %s", model, e)
+        await asyncio.sleep(0.2)
+    return out
+
+
+def _normal_cdf(z):
+    return 0.5 * (1 + math.erf(z / math.sqrt(2)))
+
+
+async def build_histcalib(session, progress_cb=None):
+    """ИСТОРИЧЕСКАЯ КАЛИБРОВКА: тянет прогноз+факт за 60 дней по городам,
+    проверяет — занижена ли σ (распределение узкое) и/или толстые ли хвосты.
+    Различает ДВЕ болезни с разными лекарствами."""
+    import datetime
+    # 5 городов по умолчанию — баланс скорости и покрытия климатов
+    cities = {
+        "Tokyo":    (35.55, 139.78),
+        "New York": (40.78, -73.97),
+        "London":   (51.51, -0.06),
+        "Karachi":  (24.90, 67.17),
+        "Chicago":  (41.98, -87.90),
+    }
+    days_back = 60
+    today = datetime.date.today()
+    end = today - datetime.timedelta(days=2)
+    start = end - datetime.timedelta(days=days_back)
+    start_s, end_s = start.isoformat(), end.isoformat()
+
+    all_z = []
+    raw_dev = []
+    for i, (city, (lat, lon)) in enumerate(cities.items(), 1):
+        if progress_cb:
+            await progress_cb(f"⏳ {city} ({i}/{len(cities)})…")
+        actual = await fetch_daily_max_actual(session, lat, lon, start_s, end_s)
+        await asyncio.sleep(0.2)
+        fc = await fetch_forecast_models(session, lat, lon, start_s, end_s)
+        for date, vals in fc.items():
+            if len(vals) < 2 or date not in actual or actual[date] is None:
+                continue
+            mean = sum(vals) / len(vals)
+            var = sum((v - mean) ** 2 for v in vals) / len(vals)
+            sigma = max(0.5, math.sqrt(var))   # пол 0.5° как в боте
+            dev = actual[date] - mean
+            all_z.append(dev / sigma)
+            raw_dev.append(dev)
+
+    n = len(all_z)
+    if n < 30:
+        return f"⚠️ Мало данных ({n} пар). Возможно, архив прогнозов недоступен на эту глубину."
+
+    L = [f"📊 ИСТОРИЧЕСКАЯ КАЛИБРОВКА ({n} пар, {len(cities)} городов, {days_back}д)", ""]
+
+    # 1. Ширина: средний |z|
+    mean_abs_z = sum(abs(z) for z in all_z) / n
+    L.append(f"1. Средний |z| = {mean_abs_z:.3f} (эталон нормали 0.798)")
+    wide = mean_abs_z > 0.95
+    if wide:
+        L.append(f"   → σ ЗАНИЖЕНА: факт отклоняется ШИРЕ нашей σ (×{mean_abs_z/0.798:.2f})")
+    elif mean_abs_z < 0.65:
+        L.append(f"   → σ завышена (распределение шире реального)")
+    else:
+        L.append(f"   → σ по ширине калибрована")
+    L.append("")
+
+    # 2. Хвосты
+    p2 = sum(1 for z in all_z if abs(z) > 2) / n
+    p3 = sum(1 for z in all_z if abs(z) > 3) / n
+    fat = p2 > 0.07 or p3 > 0.01
+    L.append(f"2. Хвосты: |z|>2σ {p2*100:.1f}% (норма 4.6%), |z|>3σ {p3*100:.1f}% (норма 0.27%)")
+    if fat:
+        L.append(f"   → ТОЛСТЫЕ ХВОСТЫ: экстремумы чаще нормали!")
+    else:
+        L.append(f"   → хвосты как у нормали")
+    L.append("")
+
+    # 3. Bias
+    mean_dev = sum(raw_dev) / len(raw_dev)
+    L.append(f"3. Сдвиг (факт−прогноз): {mean_dev:+.2f}°C")
+    if abs(mean_dev) > 0.5:
+        d = "выше" if mean_dev > 0 else "ниже"
+        L.append(f"   → прогноз смещён: факт систематически {d} (отдельная проблема)")
+    else:
+        L.append(f"   → центрирован верно")
+    L.append("")
+
+    # ВЕРДИКТ
+    L.append("ВЕРДИКТ — лекарство:")
+    if wide and fat:
+        L.append(f"σ занижена И хвосты толстые → расширить σ (×{mean_abs_z/0.798:.2f}) + t-распределение.")
+    elif wide and not fat:
+        L.append(f"σ занижена, форма нормальная → расширить σ в ×{mean_abs_z/0.798:.2f}.")
+        L.append("Чинит И завышение центра, И занижение хвостов (одна болезнь!).")
+    elif fat and not wide:
+        L.append("σ по ширине ок, хвосты толстые → t-распределение (df 3-5), σ не трогать.")
+    else:
+        L.append("Распределение калибровано → дело не в форме. Причина в другом (bias/модели).")
+    L.append("")
+    L.append("⚠️ 'σ' = разброс 4 моделей Open-Meteo, приближение нашего ансамбля.")
+    L.append("Тренд показателен, точные числа — ориентир.")
+    return "\n".join(L)
+
+
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     kb = ReplyKeyboardMarkup(
@@ -967,6 +1110,26 @@ async def btn_help(message: types.Message):
         "Пришли адрес кошелька Polymarket в формате 0x… (40 символов).\n\n"
         "Найти кошелёк: на странице профиля трейдера он в URL после /profile/.\n\n"
         "Бот скачает всю историю и разберёт стратегию.")
+
+
+@dp.message(Command("histcalib"))
+async def cmd_histcalib(message: types.Message):
+    """Историческая калибровка распределения: занижена ли σ / толстые ли хвосты.
+    Тянет прогноз+факт за 60 дней по 5 городам. ~3-5 мин."""
+    status = await message.answer("📊 Историческая калибровка распределения.\n"
+                                  "Тяну прогноз+факт за 60 дней (~3-5 мин)…")
+    async def progress(text):
+        try:
+            await status.edit_text(text)
+        except Exception:
+            pass
+    try:
+        async with aiohttp.ClientSession() as session:
+            result = await build_histcalib(session, progress_cb=progress)
+        await status.edit_text(result[:4000], disable_web_page_preview=True)
+    except Exception as e:
+        log.exception("histcalib failed")
+        await status.edit_text(f"❌ Ошибка калибровки: {type(e).__name__}: {e}")
 
 
 @dp.message(Command("check"))
@@ -1130,6 +1293,7 @@ async def main():
         BotCommand(command="start", description="Старт"),
         BotCommand(command="check", description="Разбор кошелька: /check 0x…"),
         BotCommand(command="deep", description="Глубокий посделочный: /deep 0x…"),
+        BotCommand(command="histcalib", description="Калибровка распределения погоды (σ/хвосты)"),
     ])
     log.info("Trader Check запущен")
     await dp.start_polling(bot)

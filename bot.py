@@ -945,6 +945,111 @@ def build_market_detail(activity, n=3):
     return "\n".join(L)
 
 
+async def build_frequency(session, wallet, window_days=7):
+    """ЧЕСТНАЯ частота ставок: считает уникальные рынки и сделки в ФИКСИРОВАННОМ
+    окне последних N полных дней. Пагинирует /activity, пока не выйдем за окно —
+    так числитель (рынки) и знаменатель (дни) оба корректны, без искажения
+    потолком. Отвечает: сколько РЫНКОВ/день и сколько ДОКУПОК на рынок реально."""
+    import datetime
+    now = datetime.datetime.now(datetime.timezone.utc)
+    # Окно: последние N ПОЛНЫХ суток (от начала дня N дней назад до сейчас)
+    window_start = (now - datetime.timedelta(days=window_days)).timestamp()
+
+    # Пагинируем activity, пока сделки свежее window_start
+    all_trades = []
+    offset = 0
+    page = 500
+    pages_done = 0
+    reached_window_end = False
+    for _ in range(60):  # до 30000 записей, с запасом
+        p = {"user": wallet, "limit": page, "offset": offset}
+        try:
+            async with session.get(f"{DATA_API}/activity", params=p,
+                                   timeout=aiohttp.ClientTimeout(total=30)) as r:
+                if r.status != 200:
+                    break
+                batch = await r.json()
+        except Exception as e:
+            log.warning("freq fetch offset=%s: %s", offset, e)
+            break
+        if not batch:
+            break
+        pages_done += 1
+        # Оставляем только TRADE BUY в окне
+        for a in batch:
+            if a.get("type") != "TRADE" or a.get("side") != "BUY":
+                continue
+            ts = a.get("timestamp", 0)
+            if ts < window_start:
+                reached_window_end = True
+                continue
+            all_trades.append(a)
+        # Если последняя запись в батче уже старше окна — дальше только старее
+        oldest_ts = min((a.get("timestamp", 1e18) for a in batch), default=0)
+        if oldest_ts < window_start:
+            reached_window_end = True
+            break
+        if len(batch) < page:
+            break
+        offset += page
+        await asyncio.sleep(PAUSE)
+
+    if not all_trades:
+        return (f"За последние {window_days} дней BUY-сделок не найдено "
+                f"(или кошелёк неактивен в этом окне).")
+
+    # Считаем уникальные рынки (conditionId) и докупки
+    from collections import defaultdict
+    by_market = defaultdict(list)
+    for a in all_trades:
+        by_market[a.get("conditionId")].append(a)
+
+    n_markets = len(by_market)
+    n_trades = len(all_trades)
+    # Реальный охваченный период (от самой старой до самой свежей сделки в окне)
+    ts_list = [a.get("timestamp", 0) for a in all_trades]
+    span_days = max(1e-9, (max(ts_list) - min(ts_list)) / 86400)
+    # Но если данные покрыли всё окно — делим на window_days; если оборвались
+    # раньше (не дотянули до края окна) — на реальный span
+    effective_days = window_days if reached_window_end else span_days
+
+    markets_per_day = n_markets / effective_days
+    trades_per_day = n_trades / effective_days
+    addons = [len(v) for v in by_market.values()]
+    avg_addon = sum(addons) / len(addons)
+    multi = sum(1 for v in by_market.values() if len(v) > 1)
+
+    # Распределение докупок
+    one = sum(1 for v in by_market.values() if len(v) == 1)
+    few = sum(1 for v in by_market.values() if 2 <= len(v) <= 5)
+    many = sum(1 for v in by_market.values() if len(v) > 5)
+
+    L = [f"📊 ЧАСТОТА СТАВОК — {wallet[:10]}…", ""]
+    L.append(f"Окно: последние {window_days} дней"
+             + ("" if reached_window_end else f" (данные дотянулись только до {span_days:.1f}д — пагинация не покрыла всё окно, возможно потолок)"))
+    L.append("")
+    L.append(f"Уникальных РЫНКОВ: {n_markets}")
+    L.append(f"Всего BUY-сделок: {n_trades}")
+    L.append(f"Охвачено дней: {effective_days:.1f}")
+    L.append("")
+    L.append(f"➡️ РЫНКОВ в день: {markets_per_day:.1f}")
+    L.append(f"➡️ BUY-сделок в день: {trades_per_day:.1f}")
+    L.append(f"➡️ Докупок на рынок (средн): {avg_addon:.1f}")
+    L.append("")
+    L.append(f"Рынков с докупками (>1 входа): {multi}/{n_markets} "
+             f"({multi/n_markets*100:.0f}%)")
+    L.append(f"Разбивка: 1 вход {one} │ 2-5 входов {few} │ >5 входов {many}")
+    L.append("")
+    L.append("СРАВНИ С НАШИМ БОТОМ:")
+    L.append(f"  Их рынков/день: {markets_per_day:.1f}")
+    L.append(f"  Если наш бот делает БОЛЬШЕ — берём лишние рынки (мусор?)")
+    L.append(f"  Если МЕНЬШЕ — не дотягиваем по охвату")
+    L.append("")
+    L.append("⚠️ Если выше написано 'пагинация не покрыла всё окно' —")
+    L.append("число дней оценено по span, точность ниже. Иначе — надёжно.")
+    return "\n".join(L)
+
+
 async def fetch_daily_max_actual(session, lat, lon, start, end):
     """Фактический дневной максимум за период (Open-Meteo Archive)."""
     url = "https://archive-api.open-meteo.com/v1/archive"
@@ -1110,6 +1215,23 @@ async def btn_help(message: types.Message):
         "Пришли адрес кошелька Polymarket в формате 0x… (40 символов).\n\n"
         "Найти кошелёк: на странице профиля трейдера он в URL после /profile/.\n\n"
         "Бот скачает всю историю и разберёт стратегию.")
+
+
+@dp.message(Command("freq"))
+async def cmd_freq(message: types.Message):
+    """Честная частота ставок трейдера за фиксированное окно (с пагинацией)."""
+    m = WALLET_RE.search(message.text or "")
+    if not m:
+        await message.answer("Укажи адрес: /freq 0x… (частота ставок за 7 дней)")
+        return
+    status = await message.answer("📊 Считаю частоту ставок (пагинация, ~30 сек)…")
+    try:
+        async with aiohttp.ClientSession() as session:
+            result = await build_frequency(session, m.group(0), window_days=7)
+        await status.edit_text(result[:4000], disable_web_page_preview=True)
+    except Exception as e:
+        log.exception("freq failed")
+        await status.edit_text(f"❌ Ошибка: {type(e).__name__}: {e}")
 
 
 @dp.message(Command("histcalib"))
@@ -1293,6 +1415,7 @@ async def main():
         BotCommand(command="start", description="Старт"),
         BotCommand(command="check", description="Разбор кошелька: /check 0x…"),
         BotCommand(command="deep", description="Глубокий посделочный: /deep 0x…"),
+        BotCommand(command="freq", description="Частота ставок за 7 дней: /freq 0x…"),
         BotCommand(command="histcalib", description="Калибровка распределения погоды (σ/хвосты)"),
     ])
     log.info("Trader Check запущен")

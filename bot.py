@@ -1217,6 +1217,66 @@ async def btn_help(message: types.Message):
         "Бот скачает всю историю и разберёт стратегию.")
 
 
+@dp.message(Command("export"))
+async def cmd_export(message: types.Message):
+    """Выгружает ВСЕ сырые сделки трейдера в CSV-файл для ручного анализа.
+    Позволяет проверить метрики на сырых данных (держал/продавал, реальный P&L),
+    не доверяя агрегатам. CSV открывается в Excel/Google Sheets."""
+    m = WALLET_RE.search(message.text or "")
+    if not m:
+        await message.answer("Укажи адрес: /export 0x… (выгрузка сделок в CSV)")
+        return
+    wallet = m.group(0)
+    status = await message.answer(f"📥 Качаю сделки {wallet[:10]}… в CSV (пагинация)…")
+    try:
+        async with aiohttp.ClientSession() as session:
+            activity = await fetch_all(session, "activity",
+                                       {"user": wallet, "sortBy": "TIMESTAMP"},
+                                       page_size=500, max_pages=40)
+        if not activity:
+            await status.edit_text("❌ Сделок не нашёл.")
+            return
+        # Формируем CSV
+        import csv, io, datetime
+        buf = io.StringIO()
+        # Поля: дата, тип, сторона (BUY/SELL), исход (Yes/No), цена, размер,
+        # usdcSize, рынок (title), conditionId
+        fieldnames = ["datetime_utc", "timestamp", "type", "side", "outcome",
+                      "price", "size", "usdcSize", "title", "conditionId"]
+        w = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
+        w.writeheader()
+        for a in activity:
+            ts = a.get("timestamp", 0)
+            dt = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).isoformat() if ts else ""
+            w.writerow({
+                "datetime_utc": dt,
+                "timestamp": ts,
+                "type": a.get("type", ""),
+                "side": a.get("side", ""),
+                "outcome": a.get("outcome", ""),
+                "price": a.get("price", ""),
+                "size": a.get("size", ""),
+                "usdcSize": a.get("usdcSize", ""),
+                "title": (a.get("title", "") or "").replace("\n", " "),
+                "conditionId": a.get("conditionId", ""),
+            })
+        data = buf.getvalue().encode("utf-8")
+        from aiogram.types import BufferedInputFile
+        fname = f"trades_{wallet[:10]}_{len(activity)}.csv"
+        doc = BufferedInputFile(data, filename=fname)
+        await message.answer_document(
+            doc,
+            caption=(f"📊 {len(activity)} сделок {wallet[:10]}…\n"
+                     f"Колонки: дата, тип (TRADE/REDEEM/SELL), сторона (BUY/SELL),\n"
+                     f"исход (Yes/No), цена, размер, $, рынок.\n\n"
+                     f"⚠️ Пагинация до ~20000 сделок. Если кошелёк активнее —\n"
+                     f"видны последние сделки (потолок API)."))
+        await status.delete()
+    except Exception as e:
+        log.exception("export failed")
+        await status.edit_text(f"❌ Ошибка выгрузки: {type(e).__name__}: {e}")
+
+
 @dp.message(Command("freq"))
 async def cmd_freq(message: types.Message):
     """Честная частота ставок трейдера за фиксированное окно (с пагинацией)."""
@@ -1416,6 +1476,7 @@ async def main():
         BotCommand(command="check", description="Разбор кошелька: /check 0x…"),
         BotCommand(command="deep", description="Глубокий посделочный: /deep 0x…"),
         BotCommand(command="freq", description="Частота ставок за 7 дней: /freq 0x…"),
+        BotCommand(command="export", description="Выгрузить сделки в CSV: /export 0x…"),
         BotCommand(command="histcalib", description="Калибровка распределения погоды (σ/хвосты)"),
     ])
     log.info("Trader Check запущен")
